@@ -47,11 +47,22 @@
     if (arr.length > LOG_LIMIT) arr.shift();
   }
 
-  // 代理目标：huan 公共后台（*.quicktvui.com）+ 自建后台（*.chenddcoder.cn）。
-  // 自建后台必须代理：resolve 返回的 packageUrl 指向 www.chenddcoder.cn（跨域），
-  // zip 下载 XHR 不代理会撞 CORS（www.chenddcoder.cn 响应头 Access-Control-Allow-Origin 重复）。
+  // 代理目标：huan 公共后台（*.quicktvui.com）+ 自建后台（*.chenddcoder.cn）+
+  // 天气数据源（*.open-meteo.com）。自建后台必须代理：resolve 返回的 packageUrl
+  // 指向 www.chenddcoder.cn（跨域），zip 下载 XHR 不代理会撞 CORS（www.chenddcoder.cn
+  // 响应头 Access-Control-Allow-Origin 重复）。
+  //
+  // open-meteo 加直连代理的原因：天气应用的 geocode/forecast fetch 本应靠 web-runtime
+  // 的 autoProxy 改写成 /proxy?url= 再落到本脚本，但 autoProxy 在桌面 runtime 里不保证
+  // 生效（PROXY_ALL_CROSS_ORIGIN 依赖 window.__BUNDLE_CONFIG__.watch）。一旦未改写，
+  // 该请求就会以原生跨域直发被 WebView CORS 拦下 → 应用能拉起但天气数据拉不到。
+  // 把 open-meteo 也纳入直连规则后，无需依赖 autoProxy 也能经 Rust reqwest 出网。
   function isProxyTarget(host) {
-    return host.endsWith('quicktvui.com') || host.endsWith('chenddcoder.cn');
+    return (
+      host.endsWith('quicktvui.com') ||
+      host.endsWith('chenddcoder.cn') ||
+      host.endsWith('open-meteo.com')
+    );
   }
 
   // 私有/本地网段：绝不允许经本代理发起请求（防 SSRF / 内网探测）。
@@ -209,6 +220,63 @@
     return headers;
   }
 
+  // 构造兼容 Response 对象（不依赖 window.Response）。
+  // 背景：Hippy 的 web-renderer polyfill 会替换 window.Response（构造名被压成单字符），
+  // 该 polyfill 不解析 headers 参数 —— new Response(blob, {headers: {...}}/new Headers())
+  // 产出的 response.headers 都不是真 Headers（无 .keys()），调用方 r.json() 内部
+  // 执行 this.headers.keys() 会抛 "headers.keys is not a function"（天气应用即此症状：
+  // 代理已拿到 200 + 数据，却死在 Response 重建）。autoProxy 已有同款教训并绕开
+  // （createProxyResponse 返回兼容对象），这里同样返回带 Headers 风格接口 +
+  // text/json/arrayBuffer/blob 方法的兼容对象，行为对齐标准 Response。
+  function createCompatResponse(status, headersMap, bytes) {
+    var keys = [];
+    var lower = {};
+    var contentType = '';
+    Object.keys(headersMap || {}).forEach(function (k) {
+      keys.push(k);
+      lower[k.toLowerCase()] = k;
+      if (k.toLowerCase() === 'content-type') contentType = headersMap[k];
+    });
+    var headers = {
+      get: function (name) {
+        var lk = String(name).toLowerCase();
+        var real = lower[lk];
+        return real !== undefined ? headersMap[real] : null;
+      },
+      has: function (name) {
+        return lower[String(name).toLowerCase()] !== undefined;
+      },
+      keys: function () { return keys.slice(); },
+      values: function () { return keys.map(function (k) { return headersMap[k]; }); },
+      entries: function () { return keys.map(function (k) { return [k, headersMap[k]]; }); },
+      forEach: function (cb) {
+        keys.forEach(function (k) { cb(headersMap[k], k, headers); });
+      },
+    };
+    var textCache = null;
+    function decode() {
+      if (textCache === null) textCache = new TextDecoder().decode(bytes);
+      return textCache;
+    }
+    return {
+      ok: status >= 200 && status < 300,
+      status: status,
+      statusText: status >= 200 && status < 300 ? 'OK' : '',
+      headers: headers,
+      url: '',
+      type: 'basic',
+      redirected: false,
+      text: function () { return Promise.resolve(decode()); },
+      json: function () { return Promise.resolve(JSON.parse(decode())); },
+      arrayBuffer: function () {
+        return Promise.resolve(
+          bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+        );
+      },
+      blob: function () { return Promise.resolve(new Blob([bytes], { type: contentType })); },
+    };
+  }
+
   function bodyToBytes(body) {
     if (body == null) return null;
     if (typeof body === 'string') return new TextEncoder().encode(body);
@@ -235,10 +303,9 @@
     });
     return invokeProxy(method, t.url, headers, bodyBytes).then(function (p) {
       var buf = b64ToBytes(p.bodyBase64);
-      var rh = new Headers();
-      Object.keys(p.headers || {}).forEach(function (k) { rh.set(k, p.headers[k]); });
-      var blob = new Blob([buf], { type: rh.get('content-type') || '' });
-      return new Response(blob, { status: p.status, headers: rh });
+      // 不能 new Response(blob, {headers})：Hippy polyfill 的 Response 不解析 headers，
+      // 会产出无 .keys() 的坏 headers → 调用方 r.json() 崩溃。用兼容对象替代。
+      return createCompatResponse(p.status, p.headers || {}, buf);
     });
   };
 
