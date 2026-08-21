@@ -1,14 +1,24 @@
 // 设备描述与 SCPD 生成 —— 从 工具类/dlna-cast 的 device-description.ts 移植
 // 纯函数，无副作用，只负责把 DLNA DMR 的 XML 描述拼出来。
 
+use std::sync::Mutex;
+
 pub struct DeviceDesc {
     uuid: String,
-    friendly_name: String,
+    friendly_name: Mutex<String>,
 }
 
 impl DeviceDesc {
     pub fn new(uuid: String, friendly_name: String) -> Self {
-        Self { uuid, friendly_name }
+        Self {
+            uuid,
+            friendly_name: Mutex::new(friendly_name),
+        }
+    }
+
+    /// 运行时修改广播名（DLNA 运行中调用同样生效）。
+    pub fn set_friendly_name(&self, name: String) {
+        *self.friendly_name.lock().unwrap() = name;
     }
 
     #[allow(dead_code)]
@@ -37,6 +47,8 @@ impl DeviceDesc {
     }
 
     fn build_device_description(&self) -> String {
+        // 先取出广播名快照（Mutex guard 不能跨 format! 占位符作用域存活），再在模板中消费。
+        let friendly = Self::escape_xml(&*self.friendly_name.lock().unwrap());
         format!(
             r#"<?xml version="1.0"?>
 <root xmlns="urn:schemas-upnp-org:device-1-0">
@@ -72,7 +84,7 @@ impl DeviceDesc {
     </serviceList>
   </device>
 </root>"#,
-            friendly = Self::escape_xml(&self.friendly_name),
+            friendly = friendly,
             uuid = Self::escape_xml(&self.uuid)
         )
     }
