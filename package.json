@@ -1,0 +1,19 @@
+{
+  "name": "quickapp-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "快应用桌面运行时 (Tauri v2) —— 复用 web-runtime/dist 作为前端",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "serve": "node scripts/serve.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

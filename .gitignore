@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Rust build artifacts
+src-tauri/target/
+
+# Tauri generated capability / schema JSON (regenerated on build)
+src-tauri/gen/schemas/
+
+# Local env / secrets (deploy token 等，切勿提交)
+.deploy.env
+*.local
+
+# OS / editor
+.DS_Store
+Thumbs.db

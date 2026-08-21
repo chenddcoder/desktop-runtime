@@ -1,0 +1,27 @@
+[package]
+name = "quickapp-desktop"
+version = "0.1.0"
+description = "快应用桌面运行时 (Tauri v2)"
+authors = ["chendd"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+base64 = "0.22"
+socket2 = "0.5"
+
+[features]
+# 默认关闭自定义-protocol，开发态用 devUrl(http) 即可
+default = []

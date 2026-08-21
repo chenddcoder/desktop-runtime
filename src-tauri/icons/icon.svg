@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="QuickAppDesktop icon - desktop monitor">
+  <g transform="translate(80,80) scale(0.84375)">
+    <rect x="0" y="0" width="1024" height="1024" rx="232" fill="#1C6DB5"/>
+
+    <!-- 整体放大 1.10× 关于中心；内部再下移 47 使窗口居中 -->
+    <g transform="translate(512,512) scale(1.15) translate(-512,-512)">
+      <g transform="translate(0,47)">
+        <!-- cast waves (加粗) -->
+        <g fill="none" stroke="#FFFFFF" stroke-linecap="round">
+          <path d="M852.19 261.90 A78 78 0 0 1 802.10 211.81" stroke-width="28" stroke-opacity="0.95"/>
+          <path d="M876.91 253.86 A104 104 0 0 1 810.14 187.09" stroke-width="28" stroke-opacity="0.78"/>
+          <path d="M901.64 245.83 A130 130 0 0 1 818.17 162.36" stroke-width="28" stroke-opacity="0.58"/>
+        </g>
+        <circle cx="778" cy="286" r="36" fill="#FFFFFF" fill-opacity="0.95"/>
+
+        <!-- monitor shadow -->
+        <path d="M262 304 L742 304 A46 46 0 0 1 788 350 L788 650 A46 46 0 0 1 742 696 L506 696 L506 750 L614 750 A16 16 0 0 1 630 766 L630 774 L394 774 L394 766 A16 16 0 0 1 410 750 L518 750 L518 696 L262 696 A46 46 0 0 1 216 650 L216 350 A46 46 0 0 1 262 304 Z" fill="#06294A" fill-opacity="0.18"/>
+
+        <!-- monitor -->
+        <rect x="246" y="286" width="532" height="358" rx="46" fill="#FFFFFF"/>
+        <rect x="486" y="644" width="60" height="60" rx="10" fill="#FFFFFF"/>
+        <rect x="406" y="700" width="212" height="34" rx="16" fill="#FFFFFF"/>
+
+        <!-- screen content: video + play (加粗描边) -->
+        <rect x="306" y="346" width="412" height="238" rx="30" fill="#185FA5"/>
+        <path d="M460 386 L460 548 L620 467 Z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="76" stroke-linejoin="round"/>
+      </g>
+    </g>
+  </g>
+</svg>
