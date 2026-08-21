@@ -48,10 +48,33 @@ fn devtools_enabled() -> bool {
 // 投屏播放叠层脚本（注入到 web-runtime 页面，监听 dlna://play 全屏播放）。
 // 通过 WebviewWindowBuilder.initialization_script 注入，不改 web-runtime 本体。
 const DLNA_OVERLAY_JS: &str = include_str!("../dlna_overlay.js");
-// 缩放自适应 + es_pkg 预加载（es.tv.huan.escast）：经 initialization_script 注入，不改 web-runtime 本体。
+// 缩放自适应 + es_pkg 预加载：经 initialization_script 注入，不改 web-runtime 本体。
 const UI_SCALE_JS: &str = include_str!("../ui_scale.js");
 // 跨域代理注入（绕过浏览器 CORS，让 es_pkg 的 resolve / zip 下载走 Rust reqwest）。
 const PROXY_FETCH_JS: &str = include_str!("../proxy_fetch.js");
+
+// 默认加载的快应用配置（es-app.config.json，编译期注入）。
+// 想打包成另一个桌面应用（如天气），只改这个文件：{"esPackage":"cn.chenddcoder.weather","appName":"天气"}
+// 后重新 cargo build 即可；dev 与 release 都通过 ui_scale.js 读 window.__ES_DEFAULT_PKG__ 生效。
+const ES_APP_CONFIG_JSON: &str = include_str!("../es-app.config.json");
+
+/// 解析默认快应用配置；字段缺失时兜底 tvcast（投屏显象）。
+fn es_app_config() -> (String, String) {
+    let (pkg_default, name_default) = ("cn.chenddcoder.tvcast".to_string(), "投屏显象".to_string());
+    let v: serde_json::Value =
+        serde_json::from_str(ES_APP_CONFIG_JSON).unwrap_or(serde_json::Value::Null);
+    let pkg = v
+        .get("esPackage")
+        .and_then(|x| x.as_str())
+        .map(String::from)
+        .unwrap_or(pkg_default);
+    let name = v
+        .get("appName")
+        .and_then(|x| x.as_str())
+        .map(String::from)
+        .unwrap_or(name_default);
+    (pkg, name)
+}
 
 fn main() {
     tauri::Builder::default()
@@ -64,18 +87,22 @@ fn main() {
         .setup(|app| {
             // 用 Rust 建窗口（而非仅 config），以便注入初始化脚本 + 锁定 16:9。
             // 开发态（debug）走 tauri.conf.json 的 devUrl（本地 serve.mjs:1420 服务本地 web-runtime/dist，
-            //   自带 /proxy 端点 + es_pkg 参数，与 web-cli dev 行为一致）；
+            //   自带 /proxy 端点，与 web-cli dev 行为一致；es_pkg 由 ui_scale.js 注入默认包）；
             // 发布态（release）加载内置 asset（frontendDist 打包进二进制），
-            //   es_pkg 由 ui_scale.js 的 ensureEsPkg 用 history.replaceState 原地注入（不导航、不循环）。
+            //   es_pkg 同样由 ui_scale.js 的 ensureEsPkg 用 history.replaceState 原地注入（不导航、不循环）。
             // 注意：绝不能再 External 到 runtime.chenddcoder.cn —— 那是 web-cli 的 dev runtime，
             //   AutoProxy 全代理模式会把 Tauri 自身的 ipc:// IPC 也代理，造成递归 → 内存爆炸（7GB）。
-            let url = if cfg!(debug_assertions) {
-                WebviewUrl::App("index.html".into())
-            } else {
-                WebviewUrl::App("index.html".into())
-            };
+            // 默认加载哪个快应用由 es-app.config.json 的 esPackage 决定（改配置 + 重新构建即换应用）。
+            let url = WebviewUrl::App("index.html".into());
+            // 把默认 es_pkg 提前注入为全局变量，供 ui_scale.js 的 ensureEsPkg 读取（须先于 UI_SCALE_JS 执行）
+            let (es_pkg, app_name) = es_app_config();
+            let es_pkg_js = format!(
+                "window.__ES_DEFAULT_PKG__ = {};",
+                serde_json::to_string(&es_pkg).unwrap_or_else(|_| "\"cn.chenddcoder.tvcast\"".into())
+            );
+            eprintln!("[desktop-runtime] default es_pkg={es_pkg} appName={app_name}");
             let window = WebviewWindowBuilder::new(app, "main", url)
-                .title("快应用桌面运行时")
+                .title(&app_name)
                 .inner_size(1600.0, 900.0)
                 .min_inner_size(640.0, 360.0)
                 .resizable(true)
@@ -83,6 +110,7 @@ fn main() {
                 .fullscreen(false)
                 .center()
                 .initialization_script(DLNA_OVERLAY_JS)
+                .initialization_script(&es_pkg_js)
                 .initialization_script(UI_SCALE_JS)
                 .initialization_script(PROXY_FETCH_JS)
                 .build()

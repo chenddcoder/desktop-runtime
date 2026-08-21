@@ -5,7 +5,7 @@
   "identifier": "com.chendd.quickapp.desktop",
   "build": {
     "beforeDevCommand": "node scripts/serve.mjs 1420",
-    "devUrl": "http://localhost:1420/?es_pkg=cn.chenddcoder.tvcast",
+    "devUrl": "http://localhost:1420/",
     "beforeBuildCommand": "",
     "frontendDist": "../../quicktvui/packages/web-runtime/dist"
   },

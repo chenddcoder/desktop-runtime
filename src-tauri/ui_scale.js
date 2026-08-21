@@ -1,11 +1,12 @@
 // desktop-runtime 注入脚本（不改 web-runtime 本体）
 // 职责：
-//   ① 预加载 cn.chenddcoder.tvcast（投屏显象）——利用 web-runtime loader 原生支持的 ?es_pkg= 参数
-//      加载源走自建后台 runtime.chenddcoder.cn（web-runtime 产物 + 加密 resolver + vue-ai 后端）
+//   ① 预加载默认快应用（包名来自 main.rs 注入的 window.__ES_DEFAULT_PKG__，
+//      对应 src-tauri/es-app.config.json 的 esPackage）——利用 web-runtime loader
+//      原生支持的 ?es_pkg= 参数；加载源走自建后台 runtime.chenddcoder.cn
 //   ② 窗口缩放自适应——修复 web-runtime 内置 scaleApp() 在 resize 时不重新计算导致 UI 不缩放的问题
 //
-// 注意：devUrl 已带 ?es_pkg=，ensureEsPkg 主要兜底（离线/手工启动时仍生效）；
-//       若 URL 已有显式参数，绝不重置 location（避免 devUrl 参数被反复 reload）。
+// 注意：dev/release 的 URL 默认不带 es_pkg，ensureEsPkg 统一注入默认包；
+//       若 URL 已有显式参数，绝不重置 location（避免参数被反复 reload）。
 (function () {
   'use strict';
 
@@ -31,11 +32,13 @@
     log('resolver', 'set __CROSS_APP_RESOLVER_BASE__', window.__CROSS_APP_RESOLVER_BASE__);
   }
 
-  // ===================== ① 预加载 cn.chenddcoder.tvcast =====================
+  // ===================== ① 预加载默认快应用 =====================
   // web-runtime 的 loader 原生支持 ?es_pkg=<pkg> 加载快应用：
   //   - 优先读本地 IndexedDB 缓存（pkg:<pkg>）
   //   - 再 getPackageInfo 在线 resolve 下载 URL/MD5/版本，下载并加载 zip bundle
   // 仅当用户未显式指定加载方式（es_pkg/bundle/zipUrl/zip）时默认追加。
+  // 默认包来自 main.rs 注入的 window.__ES_DEFAULT_PKG__（对应 es-app.config.json 的 esPackage），
+  // 改配置文件后重新构建即可整体切换桌面应用（如打包成天气）。
   //
   // 2026-08-21 修复：从 location.replace 改为 history.replaceState。
   // 原因：replace 会触发页面导航，在 tauri://localhost（release 内置 asset）等自定义
@@ -44,6 +47,7 @@
   // 彻底消除循环。另加 window.name 标记做双保险（跨导航保留，防任何残余循环路径）。
   (function ensureEsPkg() {
     try {
+      var defaultPkg = window.__ES_DEFAULT_PKG__ || 'cn.chenddcoder.tvcast';
       var u = new URL(window.location.href);
       var explicit =
         u.searchParams.has('es_pkg') ||
@@ -64,8 +68,8 @@
         return;
       }
       window.name = 'es_pkg_redirected';
-      log('es_pkg', 'injecting es_pkg=cn.chenddcoder.tvcast via replaceState (no navigation)');
-      u.searchParams.set('es_pkg', 'cn.chenddcoder.tvcast');
+      log('es_pkg', 'injecting es_pkg=' + defaultPkg + ' via replaceState (no navigation)');
+      u.searchParams.set('es_pkg', defaultPkg);
       window.history.replaceState(null, '', u.toString());
     } catch (e) {
       log('error', 'ensureEsPkg failed', { message: e && e.message });

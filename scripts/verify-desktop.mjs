@@ -80,9 +80,8 @@ page.on('console', (m) => { logs.push(m.type() + ': ' + m.text()); });
 page.on('pageerror', (e) => { logs.push('pageerror: ' + e.message); });
 
 // ===== 1) 打开 index.html → ui_scale 应注入 es_pkg=<默认包> =====
-// 用 /home 路径（serve SPA fallback 到 index.html）：es3-router 把 /index.html 解析成 / 无匹配
-// （routes 无 / 且 error 路由缺失）会白屏；/home 直接命中首屏路由。
-await page.goto(`${BASE}/home`, { waitUntil: 'load', timeout: 30000 });
+// 根路径 /（模拟 desktop devUrl http://localhost:1420/）：由 tvcast 的 / 路由（homeRoot）承接。
+await page.goto(`${BASE}/`, { waitUntil: 'load', timeout: 30000 });
 await page.waitForFunction(
   (pkg) => new RegExp('es_pkg=' + pkg.replace(/[.]/g, '\\.')).test(location.href),
   DEFAULT_PKG,

@@ -2395,6 +2395,7 @@ dependencies = [
  "tauri-plugin-fs",
  "tauri-plugin-shell",
  "tokio",
+ "url",
 ]
 
 [[package]]

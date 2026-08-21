@@ -54,12 +54,28 @@
     return host.endsWith('quicktvui.com') || host.endsWith('chenddcoder.cn');
   }
 
+  // 私有/本地网段：绝不允许经本代理发起请求（防 SSRF / 内网探测）。
+  // 与 serve.mjs 的 isPrivateHost 保持一致；Rust 侧 proxy_http 也有同样的兜底拦截。
+  function isPrivateHost(host) {
+    if (!host) return true;
+    host = host.toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0') return true;
+    if (/^10\./.test(host)) return true;
+    if (/^192\.168\./.test(host)) return true;
+    if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(host)) return true;
+    if (/^169\.254\./.test(host)) return true; // link-local
+    return false;
+  }
+
   // 命中规则（顺序敏感，返回最早命中即停）：
   //   ① URL host 是代理目标（quicktvui.com / chenddcoder.cn）—— 直接代理
-  //   ② URL 是 `<current-host>/proxy?url=<encoded>` 形式 —— dev 模式下 web-runtime 的
-  //      autoProxy 把跨域请求改写到 `<devUrl-host>/proxy?url=<encoded>`，目标指向 SPA fallback
-  //      （serve.mjs / web-cli dev 都返回 HTML），不解开会返回整页 HTML 当响应。
-  //      这里解开 `url` 参数直走 Rust 代理，避免这趟「假中转」。
+  //   ② URL 是 `<current-host>/proxy?url=<encoded>` 形式 —— web-runtime 的 autoProxy
+  //      （生产 bundle 也内置，release 下 devUrl 不存在）把跨域请求改写成
+  //      `<origin>/proxy?url=<encoded>`。release 下 tauri://localhost 没有 /proxy 服务端点，
+  //      落到本地 404；dev 下 serve.mjs 虽有 /proxy，但走那趟会多一跳且依赖 dev server 在线。
+  //      这里解开 `url` 参数，对**任意公网 host** 一律直走 Rust 代理（proxy_http 用 reqwest
+  //      真实发请求，dev/release 都可用），从而让天气 API（api.open-meteo.com 等）在桌面端畅通。
+  //      私有/本地 host 一律拒绝，避免成为开放代理。
   // 其它全部走原生实现，不二次代理。
   function resolveTarget(rawUrl) {
     var noop = { proxied: false, url: rawUrl, isDevProxy: false };
@@ -74,9 +90,10 @@
         if (orig) {
           try {
             var o = new URL(orig, location.href);
-            if (isProxyTarget(o.hostname)) {
+            if (!isPrivateHost(o.hostname)) {
               return { proxied: true, url: o.toString(), isDevProxy: true };
             }
+            log('warn', 'reject proxy to private host', { host: o.hostname });
           } catch (e) { /* ignore */ }
         }
       }

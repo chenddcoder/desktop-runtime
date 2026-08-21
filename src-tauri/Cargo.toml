@@ -21,6 +21,7 @@ regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 base64 = "0.22"
 socket2 = "0.5"
+url = "2"
 
 [features]
 # 默认关闭自定义-protocol，开发态用 devUrl(http) 即可

@@ -40,8 +40,55 @@ pub struct ProxyResp {
     body_base64: String,
 }
 
+/// 判断 host 是否为私有/本地网段（防 SSRF / 内网探测）。
+/// 与前端 proxy_fetch.js 的 isPrivateHost 保持一致；前端即便被绕过，
+/// Rust 侧仍作为最终兜底拒绝内网请求。
+fn is_private_host(url_str: &str) -> bool {
+    let parsed = match url::Url::parse(url_str) {
+        Ok(u) => u,
+        Err(_) => return true, // 解析失败 → 保守拒绝
+    };
+    let host = match parsed.host_str() {
+        Some(h) => h.to_lowercase(),
+        None => return true,
+    };
+    if host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "0.0.0.0"
+    {
+        return true;
+    }
+    if host.starts_with("10.") {
+        return true;
+    }
+    if host.starts_with("192.168.") {
+        return true;
+    }
+    // 172.16.0.0/12
+    if let Some(rest) = host.strip_prefix("172.") {
+        if let Some((a, _)) = rest.split_once('.') {
+            if let Ok(n) = a.parse::<u8>() {
+                if (16..=31).contains(&n) {
+                    return true;
+                }
+            }
+        }
+    }
+    // 169.254.0.0/16 link-local
+    if host.starts_with("169.254.") {
+        return true;
+    }
+    false
+}
+
 #[tauri::command]
 pub async fn proxy_http(req: ProxyReq) -> Result<String, String> {
+    // SSRF 兜底：拒绝到私有/本地网段的请求，绝不成为开放代理。
+    if is_private_host(&req.url) {
+        return Err(format!("proxy blocked: private/internal host not allowed: {}", req.url));
+    }
+
     let client = reqwest::Client::builder()
         .build()
         .map_err(|e| format!("client build failed: {e}"))?;
