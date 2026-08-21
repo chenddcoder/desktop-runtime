@@ -117,14 +117,25 @@ async function handleProxy(req, res) {
     return;
   }
 
-  // 解析 ?url=
+  // 解析目标 URL，支持两种格式（与 web-cli DevServer 的 /proxy 一致）：
+  //   1. /proxy?url=<encoded-full-url>
+  //   2. /proxy/{http|https}/{host}[:port]/{path}（web-runtime DevProxy 改写的 img/fetch 走这种）
   let target;
   try {
     const u = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-    target = u.searchParams.get("url");
+    const q = u.searchParams.get("url");
+    if (q) {
+      target = q;
+    } else {
+      const m = u.pathname.match(/^\/proxy\/(https?)\/([^/]+)(\/.*)?$/);
+      if (m) {
+        const query = u.search || "";
+        target = `${m[1]}://${m[2]}${m[3] || "/"}${query}`;
+      }
+    }
   } catch (_) {}
   if (!target) {
-    writeProxyError(res, 400, "missing url query param");
+    writeProxyError(res, 400, "invalid proxy url (expected /proxy?url= or /proxy/{http|https}/{host}/{path})");
     return;
   }
 

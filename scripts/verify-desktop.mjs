@@ -79,8 +79,10 @@ const logs = [];
 page.on('console', (m) => { logs.push(m.type() + ': ' + m.text()); });
 page.on('pageerror', (e) => { logs.push('pageerror: ' + e.message); });
 
-// ===== 1) 无参打开 index.html → ui_scale 应注入 es_pkg=<默认包> =====
-await page.goto(`${BASE}/index.html`, { waitUntil: 'load', timeout: 30000 });
+// ===== 1) 打开 index.html → ui_scale 应注入 es_pkg=<默认包> =====
+// 用 /home 路径（serve SPA fallback 到 index.html）：es3-router 把 /index.html 解析成 / 无匹配
+// （routes 无 / 且 error 路由缺失）会白屏；/home 直接命中首屏路由。
+await page.goto(`${BASE}/home`, { waitUntil: 'load', timeout: 30000 });
 await page.waitForFunction(
   (pkg) => new RegExp('es_pkg=' + pkg.replace(/[.]/g, '\\.')).test(location.href),
   DEFAULT_PKG,
@@ -96,7 +98,22 @@ await page.waitForTimeout(4000);
 const bodyText = await page.evaluate(() => (document.body ? document.body.innerText.slice(0, 300) : '(no body)'));
 console.log('PAGE_TEXT=' + JSON.stringify(bodyText));
 
-// ===== 3) 关键日志 =====
+// ===== 3) 天气卡图标检查（launcher 渲染后：img 存在 + 加载成功） =====
+// 注意：Hippy web-renderer 把 Vue 的 class 剥成内联 style，DOM 无 .app-card，
+// 只能按 name="allApp" 属性 + 文本「天气」定位卡片。
+await page.waitForTimeout(4000);
+const iconCheck = await page.evaluate(() => {
+  const cards = Array.from(document.querySelectorAll('[name="allApp"]'));
+  const card = cards.find((c) => (c.textContent || '').indexOf('天气') >= 0) || null;
+  if (!card) return { card: false, nameCards: cards.length };
+  const img = card.querySelector('img');
+  if (!img) return { card: true, img: false, text: (card.textContent || '').slice(0, 20) };
+  return { card: true, img: true, src: (img.src || '').slice(0, 50), loaded: img.complete && img.naturalWidth > 0, w: img.naturalWidth, h: img.naturalHeight };
+});
+console.log('WEATHER_ICON_CHECK=' + JSON.stringify(iconCheck));
+await page.screenshot({ path: '/tmp/verify-launcher-icons.png' });
+
+// ===== 4) 关键日志 =====
 const interesting = logs.filter((l) => /proxy_fetch|resolve|es_pkg|error|Error/i.test(l)).slice(-20);
 console.log('--- interesting logs ---');
 interesting.forEach((l) => console.log(l));
