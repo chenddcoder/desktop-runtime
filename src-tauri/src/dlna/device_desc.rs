@@ -16,6 +16,8 @@ impl DeviceDesc {
         }
     }
 
+    // 当前任务暂未接入调用方，将由后续任务 3 的 setDlnaName 命令接入。
+    #[allow(dead_code)]
     /// 运行时修改广播名（DLNA 运行中调用同样生效）。
     pub fn set_friendly_name(&self, name: String) {
         *self.friendly_name.lock().unwrap() = name;
