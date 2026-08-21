@@ -250,7 +250,7 @@ fn main() {
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![dlna::dlna_start, dlna::dlna_stop, dlna::dlna_status, dlna::dlna_report_position, proxy::proxy_http])
+        .invoke_handler(tauri::generate_handler![dlna::dlna_start, dlna::dlna_stop, dlna::dlna_status, dlna::dlna_report_position, dlna::get_dlna_name, dlna::set_dlna_name, proxy::proxy_http])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

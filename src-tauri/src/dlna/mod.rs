@@ -40,6 +40,10 @@ struct Inner {
     uuid: Mutex<String>,
     // 投屏播放状态机在 dlna_start 内创建后存入，供前端 report_position / GetPositionInfo 读取真实进度。
     av: Mutex<Option<Arc<AvTransport>>>,
+    // DLNA 设备名单源：为 None 表示尚未确定（未加载持久化/未启动）。
+    friendly_name: Mutex<Option<String>>,
+    // 运行中的 DeviceDesc（dlna_start 成功后存入），set_dlna_name 热更新广播名时取出调用。
+    desc: Mutex<Option<Arc<DeviceDesc>>>,
 }
 
 static STATE: OnceLock<Arc<Inner>> = OnceLock::new();
@@ -53,6 +57,8 @@ fn state() -> &'static Arc<Inner> {
             port: Mutex::new(None),
             uuid: Mutex::new(String::new()),
             av: Mutex::new(None),
+            friendly_name: Mutex::new(None),
+            desc: Mutex::new(None),
         })
     })
 }
@@ -169,9 +175,11 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
         }
     };
     let uuid = format!("quickapp-desktop-{}", uuid_simple());
-    let friendly = format!("快应用投屏 ({local_ip})");
-
-    let desc = Arc::new(DeviceDesc::new(uuid.clone(), friendly));
+    // 统一设备名单源（与 get_dlna_name 对齐）：持久化优先，缺省按 local_ip 生成默认名。
+    let name = dlna_name::read_stored_name().unwrap_or_else(|| dlna_name::default_name(&local_ip));
+    // 写回单源，保证后续 get_dlna_name / dlna_start 读到一致的名字。
+    *inner.friendly_name.lock().unwrap() = Some(name.clone());
+    let desc = Arc::new(DeviceDesc::new(uuid.clone(), name));
     let av = Arc::new(AvTransport::new());
     // 把状态机存进全局，前端据此上报真实播放进度（GetPositionInfo 才能返回非零 RelTime）。
     *inner.av.lock().unwrap() = Some(av.clone());
@@ -247,6 +255,8 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
     inner.running.store(true, Ordering::SeqCst);
     *inner.port.lock().unwrap() = Some(http_port);
     *inner.uuid.lock().unwrap() = uuid.clone();
+    // 成功启动后把 DeviceDesc 存入 Inner，使 set_dlna_name 能热更新广播名。
+    *inner.desc.lock().unwrap() = Some(desc.clone());
     Ok(DlnaStartResult {
         success: true,
         port: http_port,
@@ -263,6 +273,8 @@ pub async fn dlna_stop() -> Result<(), String> {
     // broadcast 一次唤醒所有订阅任务（HTTP + SSDP），不会漏唤醒
     let _ = inner.shutdown_tx.send(());
     inner.running.store(false, Ordering::SeqCst);
+    // 停止后清空运行中的 DeviceDesc，避免残留引用。
+    *inner.desc.lock().unwrap() = None;
     Ok(())
 }
 
@@ -279,6 +291,55 @@ pub fn dlna_report_position(position: u64, duration: u64, playing: bool, paused:
         }
         av.update_playback(playing, paused);
     }
+}
+
+/// 同步取本机局域网 IPv4（仅用于默认名兜底，失败回空串）。
+fn get_local_ip_now() -> String {
+    use std::net::UdpSocket;
+    let sock = match UdpSocket::bind("0.0.0.0:0") {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    match sock.connect("8.8.8.8:80") {
+        Ok(_) => sock.local_addr().map(|a| a.ip().to_string()).unwrap_or_default(),
+        Err(_) => String::new(),
+    }
+}
+
+/// 获取 DLNA 设备名。返回顺序：已确定 → 持久化 → 默认名。
+/// 命名冻结为 ProcessBridgeModule.getDlnaName，与前端/web-runtime 调用一致。
+#[tauri::command(rename = "ProcessBridgeModule.getDlnaName")]
+pub fn get_dlna_name() -> String {
+    let inner = state();
+    if let Some(name) = inner.friendly_name.lock().unwrap().as_ref() {
+        return name.clone();
+    }
+    if let Some(stored) = dlna_name::read_stored_name() {
+        *inner.friendly_name.lock().unwrap() = Some(stored.clone());
+        return stored;
+    }
+    // 尚未启动也没持久化：用同步取 IP 生成默认名
+    let name = dlna_name::default_name(&get_local_ip_now());
+    *inner.friendly_name.lock().unwrap() = Some(name.clone());
+    name
+}
+
+/// 设置 DLNA 设备名并持久化；DLNA 已运行则热更新广播。
+/// 命名冻结为 ProcessBridgeModule.setDlnaName，与前端/web-runtime 调用一致。
+#[tauri::command(rename = "ProcessBridgeModule.setDlnaName")]
+pub fn set_dlna_name(name: String) -> Result<(), String> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("设备名不能为空".into());
+    }
+    let inner = state();
+    // 与 dlna_start 保持单源一致：先写内存储态，再持久化，最后热更新运行中的 DeviceDesc。
+    *inner.friendly_name.lock().unwrap() = Some(trimmed.clone());
+    dlna_name::write_stored_name(&trimmed);
+    if let Some(desc) = inner.desc.lock().unwrap().as_ref() {
+        desc.set_friendly_name(trimmed.clone());
+    }
+    Ok(())
 }
 
 fn uuid_simple() -> String {
