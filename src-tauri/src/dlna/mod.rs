@@ -9,6 +9,7 @@
 
 pub mod av_transport;
 pub mod device_desc;
+pub mod dlna_name;
 pub mod http_server;
 pub mod soap;
 pub mod ssdp;
