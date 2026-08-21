@@ -17,25 +17,27 @@ const TV_ASPECT: f64 = 16.0 / 9.0;
 //   { "enabled": true }
 // 仅在 debug 构建生效；release 构建不含 devtools feature，open_devtools 不会编译进包。
 fn devtools_enabled() -> bool {
-    // 优先读进程工作目录（npm run dev 时为 desktop-runtime 根目录），
-    // 兜底读可执行文件旁（打包态）。任一位置存在且 enabled=true 即开启。
-    let candidates: Vec<std::path::PathBuf> = {
-        let mut v = Vec::new();
-        if let Ok(d) = std::env::current_dir() {
-            v.push(d.join("devtools.json"));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                v.push(parent.join("devtools.json"));
-            }
-        }
-        v
-    };
-    for p in candidates {
+    // 以「项目根目录（current_dir，npm run dev 时为 desktop-runtime 根）」为权威：
+    // 根目录有明确 enabled 声明即以它为准 —— 这样即使 target/debug 里遗留了 enabled=true，
+    // 也不会覆盖根目录的关闭意图（之前 devtools 关不掉的坑就源于此）。
+    // 仅当根目录没有 devtools.json / 无 enabled 字段时，才兜底读可执行文件旁（打包态）。
+    if let Ok(d) = std::env::current_dir() {
+        let p = d.join("devtools.json");
         if let Ok(text) = std::fs::read_to_string(&p) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false) {
-                    return true;
+                if let Some(b) = v.get("enabled").and_then(|x| x.as_bool()) {
+                    return b; // 根目录有明确声明 → 以此为最终值
+                }
+            }
+        }
+    }
+    // 兜底：根目录无 devtools.json 或无 enabled 字段时，读可执行文件旁（打包态）。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let p = parent.join("devtools.json");
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    return v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false);
                 }
             }
         }
