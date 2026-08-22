@@ -19,7 +19,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::broadcast;
 
 use av_transport::AvTransport;
@@ -283,6 +283,9 @@ pub async fn dlna_stop() -> Result<(), String> {
 /// 导致客户端进度条不动、拖动后读回仍是 0，看起来"进度没更新"）。
 #[tauri::command]
 pub fn dlna_report_position(position: u64, duration: u64, playing: bool, paused: bool) {
+    eprintln!(
+        "[dlna_report_position] position={position}ms duration={duration}ms playing={playing} paused={paused}"
+    );
     let inner = state();
     if let Some(av) = inner.av.lock().unwrap().as_ref() {
         av.update_position(position);
@@ -291,6 +294,69 @@ pub fn dlna_report_position(position: u64, duration: u64, playing: bool, paused:
         }
         av.update_playback(playing, paused);
     }
+}
+
+/// 快应用 ESPlayerManager 播放状态上报（与 Android 端 EsNativeModule.sendRemoteEvent 语义对齐）。
+/// 事件名/载荷由快应用侧（esapp-tvcast dlna-bridge）按 xiaoyoucast 契约发送：
+///   play / pause / stop → 更新 AvTransport 播放状态（客户端 GetTransportInfo 轮询感知）
+///   position {position: ms} → 更新真实进度（GetPositionInfo RelTime）
+///   duration {duration: ms} → 更新总时长（GetPositionInfo TrackDuration）
+///   next 等其它事件 → 仅日志（DLNA 协议无 next 概念，客户端通过 SetAVTransportURI 换源）
+/// 注意：快应用侧 position/duration 均为**毫秒**，AvTransport 内部按**秒**存储。
+#[tauri::command]
+pub fn dlna_send_remote_event(
+    app: tauri::AppHandle,
+    event_name: String,
+    event_data: Option<serde_json::Value>,
+) -> Result<(), String> {
+    let inner = state();
+    let data = event_data.unwrap_or(serde_json::Value::Null);
+    eprintln!("[dlna_send_remote_event] {event_name} data={data}");
+    let av = match inner.av.lock().unwrap().as_ref() {
+        Some(av) => av.clone(),
+        None => {
+            // DLNA 未启动时忽略（快应用可能先于 dlna_start 完成上报）。
+            return Err("DLNA 服务未运行".into());
+        }
+    };
+    let num_field = |key: &str| -> Option<u64> {
+        data.get(key)
+            .and_then(|v| v.as_u64())
+            .map(|ms| ms / 1000) // 毫秒 → 秒
+    };
+    match event_name.as_str() {
+        "play" => av.update_playback(true, false),
+        "pause" => av.update_playback(false, true),
+        "stop" => av.update_playback(false, false),
+        "position" => {
+            if let Some(secs) = num_field("position") {
+                av.update_position(secs);
+            }
+        }
+        "duration" => {
+            if let Some(secs) = num_field("duration") {
+                av.update_duration(secs);
+            }
+        }
+        // 快应用 DLNA 就绪：通知 webview 侧（dlna_overlay.js）补发缓存的投屏请求。
+        // 不依赖 window 全局信号，走 Rust → overlay 事件（对齐真机原生广播语义）。
+        "tvcast_ready" => {
+            let _ = app.emit("dlna://app-ready", serde_json::json!({}));
+        }
+        // next / heartbeat_response / tv_cmd / addDeviceEvent / sendInfoToAndroidCastEvent 等
+        // 在桌面 DLNA 场景无对应能力，仅记录日志，不影响状态机。
+        _ => {}
+    }
+    Ok(())
+}
+
+/// 诊断上报：dlna_overlay.js 把 webview 侧链路状态打回 Rust 终端（eprintln），
+/// 用于在看不到 webview 控制台时确认真实环境里投屏事件是否到达快应用。
+#[tauri::command]
+pub fn dlna_debug_log(msg: String, data: Option<serde_json::Value>) -> Result<(), String> {
+    let data = data.unwrap_or(serde_json::Value::Null);
+    eprintln!("[dlna_debug_log] {msg} data={data}");
+    Ok(())
 }
 
 /// 同步取本机局域网 IPv4（仅用于默认名兜底，失败回空串）。

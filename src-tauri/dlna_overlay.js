@@ -188,78 +188,111 @@
     // setInterval(scanQrElements, 2000);
   }
 
-  // ========== 投屏播放叠层（原职责保留） ==========
-  var overlay, video, hint, posTimer = null;
-  function buildCast() {
-    if (overlay) return;
-    overlay = document.createElement('div');
-    overlay.id = 'dlna-cast-overlay';
-    overlay.style.cssText =
-      'position:fixed;left:0;top:0;width:100%;height:100%;background:#000;' +
-      'z-index:2147483647;display:none;align-items:center;justify-content:center;';
-    video = document.createElement('video');
-    video.style.cssText = 'width:100%;height:100%;object-fit:contain;background:#000;';
-    video.setAttribute('playsinline', '');
-    video.setAttribute('webkit-playsinline', '');
-    video.controls = true;
-    overlay.appendChild(video);
-    hint = document.createElement('div');
-    hint.style.cssText =
-      'position:absolute;left:0;right:0;bottom:24px;text-align:center;color:#fff;' +
-      'font:16px/1.5 sans-serif;text-shadow:0 1px 2px #000;pointer-events:none;';
-    hint.textContent = '投屏播放中 · 按 Esc 退出';
-    overlay.appendChild(hint);
-    document.body.appendChild(overlay);
-    document.addEventListener('keydown', function (e) {
-      if (e.key === 'Escape' && overlay.style.display !== 'none') hideCast();
-    });
-  }
-  function showCast(url) {
-    buildCast();
-    video.src = url;
-    overlay.style.display = 'flex';
-    var p = video.play();
-    if (p && p.catch) p.catch(function () { hint.textContent = '点击画面开始播放 · 按 Esc 退出'; });
-    dlog('cast-show', url);
-    startPositionReporter();
-  }
-  function hideCast() {
-    if (!overlay) return;
-    try { video.pause(); } catch (e) {}
-    video.removeAttribute('src');
-    try { video.load(); } catch (e) {}
-    overlay.style.display = 'none';
-    stopPositionReporter();
-    reportStopped();
+  // ========== 投屏事件桥接：Rust dlna://* → 快应用 EventBus（ACTION_DLNA） ==========
+  // 快应用真机契约：下行控制由原生 DLNA 层广播 EventBus 事件（ACTION_DLNA /
+  // ACTION_DLNA_STATUS，payload 为 JSON 字符串）。desktop 场景由本脚本拿到
+  // es3-vue 的 EventDispatcher 后模拟原生广播，快应用与真机走同一套契约，
+  // 不再使用 window CustomEvent（真机没有浏览器 DOM）。
+  var pendingDlnaPlay = null; // 快应用 EventDispatcher 未就绪时缓存的最新投屏请求
+
+  // 诊断上报：把 overlay 侧关键链路状态经 Tauri invoke 打回 Rust 终端（eprintln），
+  // 便于在看不到 webview 控制台时确认真实环境里"事件有没有走到快应用"。
+  function reportDlnaState(msg, data) {
+    try {
+      var invoke = window.__get_invoke ? window.__get_invoke() : null;
+      if (!invoke) { dlog('debug-report', 'no invoke (skip): ' + msg, data); return; }
+      invoke('dlna_debug_log', { msg: String(msg || ''), data: data || null })
+        .then(function () { dlog('debug-report', 'reported: ' + msg, data); })
+        .catch(function (e) { dlog('warn', 'debug-report failed: ' + msg + ' ' + (e && e.message || e)); });
+    } catch (e) {
+      dlog('warn', 'debug-report throw: ' + msg + ' ' + (e && e.message || e));
+    }
   }
 
-  // —— 进度回传：DLNA 客户端进度条靠周期性 GetPositionInfo 驱动，必须让 Rust 拿到真实进度 ——
-  // 之前 GetPositionInfo 永远返回 0:00:00，导致客户端进度条不动、拖动后读回仍是 0。
-  function reportPosition() {
-    if (!video || overlay.style.display === 'none') return;
-    var dur = isFinite(video.duration) ? Math.floor(video.duration) : 0;
-    var pos = isFinite(video.currentTime) ? Math.floor(video.currentTime) : 0;
-    var playing = !video.paused && !video.ended;
-    var paused = video.paused;
-    var invoke = window.__get_invoke ? window.__get_invoke() : null;
-    if (!invoke) return;
-    invoke('dlna_report_position', { position: pos, duration: dur, playing: playing, paused: paused })
-      .catch(function () {});
+  function getEventDispatcher() {
+    try {
+      var g = (typeof global !== 'undefined' && global.__GLOBAL__) ? global.__GLOBAL__ : null;
+      if (g && g.jsModuleList && g.jsModuleList.EventDispatcher) {
+        return g.jsModuleList.EventDispatcher;
+      }
+    } catch (e) {}
+    return null;
   }
-  function reportStopped() {
-    var invoke = window.__get_invoke ? window.__get_invoke() : null;
-    if (!invoke) return;
-    // 投屏结束：position/duration 归零、playing/paused 皆否 → 后端状态机置 Stopped
-    invoke('dlna_report_position', { position: 0, duration: 0, playing: false, paused: false })
-      .catch(function () {});
+
+  // 经 es3-vue EventDispatcher 广播原生事件（与真机 EsApp 原生广播同路径）
+  // 调用格式与 web-renderer 已验证的 sendNativeEvent 完全一致：
+  //   ed.receiveNativeEvent([eventName, eventData])  （eventData 为对象）
+  // 快应用侧 parsePayload 同时兼容「对象」与「真机 JSON 字符串」两种形态。
+  //
+  // es3-vue 3.x 的 EventDispatcher(Un) 收到注入后自动 se.$emit 到业务 EventBus
+  // （与 Android 真机 EsEngine.sendNativeEvent → EventDispatcher.receiveNativeEvent
+  //  同一契约），业务层 EventBus.$on('ACTION_DLNA'/'ACTION_DLNA_STATUS') 即可收到。
+  // 事件未就绪时由调用方缓存、就绪后补发（broadcastPlay/flushPendingLoop）。
+  function broadcastToApp(eventName, eventData) {
+    var ed = getEventDispatcher();
+    if (!ed || typeof ed.receiveNativeEvent !== 'function') {
+      dlog('warn', 'EventDispatcher 未就绪，等待重试', { eventName: eventName });
+      return false;
+    }
+    try {
+      ed.receiveNativeEvent([eventName, eventData]);
+      dlog('bridge', 'broadcast ' + eventName, eventData);
+      return true;
+    } catch (e) {
+      dlog('error', 'broadcast ' + eventName + ' failed: ' + (e && e.message || e));
+      return false;
+    }
   }
-  function startPositionReporter() {
-    stopPositionReporter();
-    // 每秒回传一次真实进度；客户端 GetPositionInfo 轮询（通常 1-2s）即可平滑跟随。
-    posTimer = setInterval(reportPosition, 1000);
+
+  // 投屏请求 → ACTION_DLNA playerUrl（与 sendNativeEvent 同格式，对象形态）
+  function broadcastPlay(url) {
+    if (!url) return false;
+    var payload = { actionType: 'playerUrl', url: url, title: '' };
+    if (broadcastToApp('ACTION_DLNA', payload)) {
+      reportDlnaState('forward-play', { ok: true, url: url });
+      pendingDlnaPlay = null;
+      return true;
+    }
+    // 快应用 EventDispatcher 尚未就绪：缓存（覆盖旧的），轮询/就绪后补发
+    pendingDlnaPlay = { url: url };
+    dlog('warn', '快应用未就绪，缓存投屏请求待补发', { url: url });
+    reportDlnaState('forward-play', { ok: false, url: url, cached: true });
+    return false;
   }
-  function stopPositionReporter() {
-    if (posTimer) { clearInterval(posTimer); posTimer = null; }
+
+  // 播放控制 → ACTION_DLNA_STATUS playerStatus
+  function broadcastControl(action, extra) {
+    var payload = Object.assign({ actionType: 'playerStatus', action: action }, extra || {});
+    broadcastToApp('ACTION_DLNA_STATUS', payload);
+  }
+
+  // 轮询 EventDispatcher 就绪后补发缓存投屏请求（兜底，不依赖 app-ready 事件）
+  function flushPendingLoop() {
+    if (pendingDlnaPlay) {
+      var p = pendingDlnaPlay;
+      pendingDlnaPlay = null;
+      if (!broadcastPlay(p.url)) {
+        pendingDlnaPlay = p; // 仍不可用，退回缓存
+      }
+    }
+    setTimeout(flushPendingLoop, 500);
+  }
+
+  // Rust 侧收到快应用 sendRemoteEvent('tvcast_ready') 后 emit 的事件（加速补发）
+  function listenAppReady() {
+    if (!window.__TAURI__ || !window.__TAURI__.event) {
+      setTimeout(listenAppReady, 200);
+      return;
+    }
+    window.__TAURI__.event.listen('dlna://app-ready', function () {
+      dlog('bridge', '快应用就绪（app-ready），补发缓存投屏请求', { hasPending: !!pendingDlnaPlay });
+      reportDlnaState('app-ready', { hasPending: !!pendingDlnaPlay });
+      if (pendingDlnaPlay) {
+        var p = pendingDlnaPlay;
+        pendingDlnaPlay = null;
+        broadcastPlay(p.url);
+      }
+    });
   }
 
   function listenDlna() {
@@ -269,7 +302,11 @@
     }
     window.__TAURI__.event.listen('dlna://play', function (e) {
       var url = e && e.payload && e.payload.url;
-      if (url) showCast(url);
+      if (url) {
+        dlog('cast-play', '收到投屏请求（转发快应用）', { url: url });
+        reportDlnaState('received-play', { url: url });
+        broadcastPlay(url);
+      }
     });
     window.__TAURI__.event.listen('dlna://status', function (e) {
       var p = e && e.payload;
@@ -291,28 +328,26 @@
       var p = e && e.payload;
       if (p) dlog('msearch', p.from || '?', { st: p.st, nt: p.nt });
     });
-    // —— 投屏控制指令：之前 Rust 只 emit 了 dlna://play，Seek/Stop/Pause 被静默吞掉，
-    //    导致手机端拖动进度 / 退出投屏时桌面端 <video> 完全没反应。这里补齐监听。
+    // —— 投屏控制指令转发：手机端暂停/停止/拖动进度 → 快应用播放器跟随 ——
     window.__TAURI__.event.listen('dlna://seek', function (e) {
       var pos = e && e.payload && e.payload.position;
-      if (video && pos != null) {
-        try {
-          video.currentTime = Number(pos);
-          dlog('cast-seek', '进度跳转到 ' + pos + 's');
-          reportPosition(); // 立即把跳转后的位置回传，让客户端进度条同步
-        } catch (x) { dlog('error', 'seek 失败: ' + x.message); }
-      }
+      dlog('cast-seek', '进度跳转指令（转发快应用）', { position: pos });
+      if (pos != null) broadcastControl('seekTo', { position: Number(pos) });
     });
     window.__TAURI__.event.listen('dlna://stop', function () {
-      dlog('cast-stop', '收到停止指令，收起播放层');
-      hideCast();
+      dlog('cast-stop', '停止指令（转发快应用）');
+      broadcastControl('stop');
     });
     window.__TAURI__.event.listen('dlna://pause', function () {
-      if (video) {
-        try { video.pause(); dlog('cast-pause', '暂停'); } catch (x) {}
-      }
+      dlog('cast-pause', '暂停指令（转发快应用）');
+      broadcastControl('pause');
     });
-    dlog('tauri-ready', 'event.listen("dlna://play/seek/stop/pause/status") registered');
+    dlog('tauri-ready', 'event.listen("dlna://play/seek/stop/pause/status") registered → ACTION_DLNA');
+    reportDlnaState('overlay-listen-registered', {});
+
+    // 快应用 EventDispatcher 就绪后补发缓存投屏请求（兜底轮询 + app-ready 加速）
+    flushPendingLoop();
+    listenAppReady();
 
     // ========== P0 状态同步：轮询 dlna_status，不依赖一次性事件 ==========
     // 上一轮根因：auto-start 的 dlna://status(ok:true) 在 webview 监听者注册前就已发出，

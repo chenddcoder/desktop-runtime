@@ -28,12 +28,12 @@ pub async fn run_http(
             _ = shutdown.recv() => break,
             res = listener.accept() => {
                 match res {
-                    Ok((stream, _)) => {
+                    Ok((stream, peer)) => {
                         let app = app.clone();
                         let desc = desc.clone();
                         let av = av.clone();
                         tokio::spawn(async move {
-                            let _ = handle_conn(stream, app, desc, av).await;
+                            let _ = handle_conn(stream, app, desc, av, peer).await;
                         });
                     }
                     Err(_) => break,
@@ -49,6 +49,7 @@ async fn handle_conn(
     app: AppHandle,
     desc: Arc<DeviceDesc>,
     av: Arc<AvTransport>,
+    peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 8192];
     let n = stream.read(&mut buf).await?;
@@ -105,9 +106,27 @@ async fn handle_conn(
     if method == "POST" {
         match soap::parse_soap(&body) {
             Some(parsed) => {
+                // 请求日志：记录每个 SOAP 动作与来源客户端 IP。
+                // MetaData 字段可能携带巨大 XML（抖音投屏会带视频元数据），摘要时剔除防刷屏。
+                let mut brief: Vec<String> = Vec::new();
+                for (k, v) in &parsed.params {
+                    if k.ends_with("MetaData") || k == "MetaData" {
+                        continue;
+                    }
+                    brief.push(format!("{k}={}", if v.len() > 60 { &v[..60] } else { v }));
+                }
+                eprintln!(
+                    "[dlna_soap_req] action={} from={} params=[{}]",
+                    parsed.action,
+                    peer,
+                    brief.join(" ")
+                );
                 let outcome = soap::handle_action(&parsed.action, &parsed.params, &av);
                 let resp_params = soap::response_params(&parsed.action, &av);
                 let xml = soap::build_soap_response(&parsed.action, &parsed.service_type, &resp_params);
+                // 响应体摘要（截断防刷屏）：用于核对客户端实际收到的 XML 结构是否合规。
+                let flat: String = xml.chars().filter(|c| !c.is_whitespace()).take(160).collect();
+                eprintln!("[dlna_soap_resp] body={flat}...");
                 match outcome {
                     soap::ActionOutcome::Play(url) => {
                         // 通知前端：有人把视频投到这台桌面电脑了
@@ -153,8 +172,11 @@ async fn write_response(
         501 => "Not Implemented",
         _ => "OK",
     };
+    // UPnP Device Architecture 强制：所有 HTTP 响应必须携带值为空的 EXT: 头。
+    // 缺失时部分严格客户端（iOS / 抖音等）会丢弃 SOAP 响应体 → 投屏乐观成功（客户端
+    // 不看响应）但进度条/状态永远不更新（客户端轮询响应被丢弃）。
     let header = format!(
-        "HTTP/1.1 {status} {text}\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {text}\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\nEXT:\r\nServer: QuickApp-DLNA/1.0\r\nConnection: close\r\n\r\n",
         status = status,
         text = status_text,
         ct = content_type,

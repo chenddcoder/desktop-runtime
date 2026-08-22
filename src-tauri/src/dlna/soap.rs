@@ -171,6 +171,12 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
                 crate::dlna::av_transport::TransportState::Transitioning => "TRANSITIONING",
                 crate::dlna::av_transport::TransportState::NoMedia => "NO_MEDIA_PRESENT",
             };
+            eprintln!(
+                "[dlna_soap_resp] GetTransportInfo -> CurrentTransportState={} pos={}s dur={}s",
+                st,
+                av.position(),
+                av.duration()
+            );
             m.insert("CurrentTransportState".into(), st.into());
             m.insert("CurrentTransportStatus".into(), "OK".into());
             m.insert("CurrentSpeed".into(), "1".into());
@@ -180,6 +186,11 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             // 现在用前端 <video> 上报进 AvTransport 的真实进度。
             let pos = av.position();
             let dur = av.duration();
+            eprintln!(
+                "[dlna_soap_resp] GetPositionInfo -> RelTime={} TrackDuration={} (pos={pos}s dur={dur}s)",
+                secs_to_hms(pos),
+                secs_to_hms(dur)
+            );
             m.insert("Track".into(), "1".into());
             m.insert("TrackDuration".into(), secs_to_hms(dur));
             m.insert("TrackMetaData".into(), String::new());
