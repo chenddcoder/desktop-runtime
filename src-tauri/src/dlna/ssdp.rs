@@ -63,20 +63,51 @@ pub async fn run_ssdp(
             res = socket.recv_from(&mut buf) => {
                 if let Ok((n, addr)) = res {
                     let data = String::from_utf8_lossy(&buf[..n]);
+                    // 排查日志：收到 M-SEARCH 即打印来源与 ST（用于判断"搜不到设备"是
+                    // 网络隔离（卓易通等虚拟机多播不通）还是 ST 类型不匹配）。
+                    let st = st_from_data(&data);
+                    if data.lines().next().map(|l| l.starts_with("M-SEARCH")).unwrap_or(false) {
+                        eprintln!("[dlna_ssdp] M-SEARCH from={addr} st={st:?}");
+                    }
                     // 通知前端有控制器在搜索我们（用于排查"搜不到"问题）
                     let _ = app.emit(
                         "dlna://msearch",
                         serde_json::json!({
                             "from": addr.ip().to_string(),
                             "preview": data.lines().next().unwrap_or(""),
-                            "st": st_from_data(&data),
+                            "st": st,
                         }),
                     );
                     if let Some(resp) = handle_msearch(&data, uuid, local_ip, http_port) {
                         // 随机 0-100ms 延迟再回复，避免同网段风暴（与 TS 版一致）
                         let delay = Duration::from_millis((system_micros() % 100) as u64);
                         tokio::time::sleep(delay).await;
-                        let _ = socket.send_to(resp.as_bytes(), addr).await;
+                        // ① 单播响应（规范路径；但 ARP 不可达的虚拟网卡客户端收不到）
+                        let single = socket.send_to(resp.as_bytes(), addr).await;
+                        eprintln!("[dlna_ssdp] M-SEARCH respond to={addr} st={st:?} send={single:?}");
+                        // ② 响应同时发多播组（兼容层保底）：SSDP 客户端加入
+                        //    239.255.255.250:1900 组后能收到发往组的所有包（多播不依赖 ARP）。
+                        //    卓易通等安卓兼容层虚拟网卡能发多播但不响应 ARP（入站单播
+                        //    EHOSTUNREACH/Host is down）→ 单播响应永远到不了，设备搜不到。
+                        //    多播响应让客户端拿到 LOCATION 后主动 GET device-desc（出站
+                        //    由客户端发起 ARP，能通）→ 设备可被发现。
+                        let mcast = socket
+                            .send_to(resp.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT))
+                            .await;
+                        if let Err(e) = &mcast {
+                            eprintln!("[dlna_ssdp] M-SEARCH respond multicast failed: {e}");
+                        }
+                        // ③ 补发多播 NOTIFY alive：部分客户端只监听多播主动广播。
+                        let location = format!("http://{local_ip}:{http_port}/device-desc.xml");
+                        for msg in build_notify_messages(uuid, &location) {
+                            if let Err(e) = socket
+                                .send_to(msg.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT))
+                                .await
+                            {
+                                eprintln!("[dlna_ssdp] NOTIFY multicast send failed: {e}");
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -130,7 +161,7 @@ fn build_notify_messages(uuid: &str, location: &str) -> Vec<String> {
 
 fn build_notify(nt: &str, usn: &str, location: &str) -> String {
     format!(
-        "NOTIFY * HTTP/1.1\r\nHOST: {addr}:{port}\r\nCACHE-CONTROL: max-age=1800\r\nLOCATION: {loc}\r\nSERVER: QuickAppDesktop/1.0 UPnP/1.0\r\nNT: {nt}\r\nNTS: ssdp:alive\r\nUSN: {usn}\r\nContent-Length: 0\r\n\r\n",
+        "NOTIFY * HTTP/1.1\r\nHOST: {addr}:{port}\r\nCACHE-CONTROL: max-age=1800\r\nLOCATION: {loc}\r\nSERVER: Linux/6.0 UPnP/1.1 QuickApp-DLNA/1.0\r\nNT: {nt}\r\nNTS: ssdp:alive\r\nUSN: {usn}\r\nContent-Length: 0\r\n\r\n",
         addr = SSDP_MULTICAST_ADDR,
         port = SSDP_PORT,
         loc = location,
@@ -144,10 +175,7 @@ fn handle_msearch(data: &str, uuid: &str, local_ip: &str, http_port: u16) -> Opt
     if !first.starts_with("M-SEARCH * HTTP/1.1") {
         return None;
     }
-    let st = data
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("ST:").map(|v| v.trim().to_string()))
-        .unwrap_or_default();
+    let st = st_from_data(data);
     if !should_respond(&st, uuid) {
         return None;
     }
@@ -155,35 +183,42 @@ fn handle_msearch(data: &str, uuid: &str, local_ip: &str, http_port: u16) -> Opt
     Some(build_msearch_response(&st, uuid, &location))
 }
 
-fn should_respond(st: &str, uuid: &str) -> bool {
-    let our_types = [
-        "urn:schemas-upnp-org:device:MediaRenderer:1",
-        "urn:schemas-upnp-org:service:AVTransport:1",
-        "urn:schemas-upnp-org:service:ConnectionManager:1",
-        "urn:schemas-upnp-org:service:RenderingControl:1",
-        "ssdp:all",
-        "upnp:rootdevice",
-    ];
-    our_types.contains(&st) || st == format!("uuid:{uuid}")
+/// ST 匹配策略：已知类型 + 任意未知 ST 兜底响应（ST 回显原值）。
+/// 安卓抖音/乐播等 DLNA SDK 常发 DIAL（urn:dial-multiscreen-org:service:dial:1）
+/// 或版本化类型（MediaRenderer:2）——精确匹配会漏掉 → 设备"搜不到"。
+/// 兜底响应是 gmrender/mediathek 等 DMR 的通行做法（ST 回显 + rootdevice USN）。
+fn should_respond(st: &str, _uuid: &str) -> bool {
+    if st.is_empty() {
+        return false; // 无 ST 的 M-SEARCH 不响应（非规范）
+    }
+    true
 }
 
+/// 响应 USN 按 ST 类型规范化：
+///  - ssdp:all / rootdevice → uuid:{uuid}::upnp:rootdevice
+///  - uuid:{uuid}          → uuid:{uuid}
+///  - 其它（含 DIAL/未知）  → uuid:{uuid}::{st}（回显）
 fn build_msearch_response(st: &str, uuid: &str, location: &str) -> String {
+    let usn = if st == "ssdp:all" || st == "upnp:rootdevice" {
+        format!("uuid:{uuid}::upnp:rootdevice")
+    } else if st.starts_with("uuid:") {
+        st.to_string()
+    } else {
+        format!("uuid:{uuid}::{st}")
+    };
     format!(
-        "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nDATE: {date}\r\nEXT:\r\nLOCATION: {loc}\r\nSERVER: QuickAppDesktop/1.0 UPnP/1.0\r\nST: {st}\r\nUSN: uuid:{uuid}::{st}\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nDATE: {date}\r\nEXT:\r\nLOCATION: {loc}\r\nSERVER: Linux/6.0 UPnP/1.1 QuickApp-DLNA/1.0\r\nST: {st}\r\nUSN: {usn}\r\nContent-Length: 0\r\n\r\n",
         date = http_date(),
         loc = location,
         st = st,
-        uuid = uuid
+        usn = usn
     )
 }
 
 fn http_date() -> String {
-    // RFC1123 近似：绝大多数 DLNA 控制器对 SSDP 200 OK 的 DATE 不严格校验
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("Wed, {:02} Jan 2099 00:00:00 GMT", secs % 28)
+    // RFC1123 真实日期（chrono 已为直接依赖）：部分安卓 DLNA SDK 校验 DATE 头格式，
+    // 之前硬编码 "Jan 2099" 假日期可能导致响应被丢弃。
+    chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 fn system_micros() -> u128 {
