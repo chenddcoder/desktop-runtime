@@ -16,6 +16,9 @@ pub enum TransportState {
 pub struct AvTransport {
     state: Mutex<TransportState>,
     track_uri: Mutex<String>,
+    /// SetAVTransportURI 携带的 DIDL-Lite 元数据（抖音等客户端会校验
+    /// GetPositionInfo 返回的 TrackMetaData 与投屏时传入的一致，空则丢弃响应）。
+    track_meta_data: Mutex<String>,
     position: Mutex<u64>,
     duration: Mutex<u64>,
 }
@@ -26,6 +29,7 @@ impl AvTransport {
         Self {
             state: Mutex::new(TransportState::NoMedia),
             track_uri: Mutex::new(String::new()),
+            track_meta_data: Mutex::new(String::new()),
             position: Mutex::new(0),
             duration: Mutex::new(0),
         }
@@ -37,6 +41,10 @@ impl AvTransport {
 
     pub fn track_uri(&self) -> String {
         self.track_uri.lock().unwrap().clone()
+    }
+
+    pub fn track_meta_data(&self) -> String {
+        self.track_meta_data.lock().unwrap().clone()
     }
 
     fn allowed_actions(&self) -> String {
@@ -59,8 +67,9 @@ impl AvTransport {
         })
     }
 
-    pub fn set_uri(&self, uri: &str) {
+    pub fn set_uri(&self, uri: &str, meta_data: &str) {
         *self.track_uri.lock().unwrap() = uri.to_string();
+        *self.track_meta_data.lock().unwrap() = meta_data.to_string();
         *self.position.lock().unwrap() = 0;
         *self.state.lock().unwrap() = TransportState::Stopped;
     }
@@ -134,6 +143,7 @@ impl AvTransport {
     pub fn reset(&self) {
         *self.state.lock().unwrap() = TransportState::NoMedia;
         *self.track_uri.lock().unwrap() = String::new();
+        *self.track_meta_data.lock().unwrap() = String::new();
         *self.position.lock().unwrap() = 0;
         *self.duration.lock().unwrap() = 0;
     }

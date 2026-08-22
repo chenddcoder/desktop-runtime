@@ -129,7 +129,15 @@ pub fn handle_action(action: &str, params: &HashMap<String, String>, av: &AvTran
     match action {
         "SetAVTransportURI" => {
             if let Some(uri) = params.get("CurrentURI") {
-                av.set_uri(&decode_html_entities(uri));
+                // params 值在 parse_soap 时已 decode_html_entities，此处直接保存解码后的
+                // DIDL-Lite XML；GetPositionInfo 需原样回传 TrackMetaData（客户端会校验一致性）。
+                let meta = params.get("CurrentURIMetaData").cloned().unwrap_or_default();
+                eprintln!(
+                    "[dlna_soap_req] SetAVTransportURI metaLen={} metaHead={}",
+                    meta.len(),
+                    meta.chars().take(120).collect::<String>()
+                );
+                av.set_uri(&decode_html_entities(uri), &meta);
             }
             ActionOutcome::StateChanged
         }
@@ -186,15 +194,20 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             // 现在用前端 <video> 上报进 AvTransport 的真实进度。
             let pos = av.position();
             let dur = av.duration();
+            let uri = av.track_uri();
+            let meta = av.track_meta_data();
             eprintln!(
-                "[dlna_soap_resp] GetPositionInfo -> RelTime={} TrackDuration={} (pos={pos}s dur={dur}s)",
+                "[dlna_soap_resp] GetPositionInfo -> RelTime={} TrackDuration={} (pos={pos}s dur={dur}s) TrackURI={uri:?} TrackMetaData.len={}",
                 secs_to_hms(pos),
-                secs_to_hms(dur)
+                secs_to_hms(dur),
+                meta.len()
             );
             m.insert("Track".into(), "1".into());
             m.insert("TrackDuration".into(), secs_to_hms(dur));
-            m.insert("TrackMetaData".into(), String::new());
-            m.insert("TrackURI".into(), av.track_uri());
+            // 回传投屏时携带的 DIDL-Lite 元数据（规范要求与 SetAVTransportURI 一致；
+            // 之前恒为空，抖音等客户端校验失败会丢弃整个响应 → 进度条/下一集判断失效）。
+            m.insert("TrackMetaData".into(), meta);
+            m.insert("TrackURI".into(), uri);
             m.insert("RelTime".into(), secs_to_hms(pos));
             m.insert("AbsTime".into(), secs_to_hms(pos));
             m.insert("RelCount".into(), "0".into());
@@ -331,7 +344,7 @@ mod tests {
         assert_eq!(parsed.action, "Seek");
         // 通过 handle_action 验证能正确转成秒并发出 Seek(90)
         let av = crate::dlna::av_transport::AvTransport::new();
-        av.set_uri("http://x/v.mp4");
+        av.set_uri("http://x/v.mp4", "");
         av.play();
         let outcome = handle_action("Seek", &parsed.params, &av);
         match outcome {
@@ -343,7 +356,7 @@ mod tests {
     #[test]
     fn seek_parses_bare_seconds_and_mmss() {
         let av = crate::dlna::av_transport::AvTransport::new();
-        av.set_uri("http://x/v.mp4");
+        av.set_uri("http://x/v.mp4", "");
         av.play();
 
         let mut p1 = std::collections::HashMap::new();
@@ -364,7 +377,7 @@ mod tests {
     #[test]
     fn get_position_info_returns_real_progress() {
         let av = crate::dlna::av_transport::AvTransport::new();
-        av.set_uri("http://x/v.mp4");
+        av.set_uri("http://x/v.mp4", "");
         av.update_position(90); // 1:30
         av.update_duration(600); // 10:00
         let m = response_params("GetPositionInfo", &av);

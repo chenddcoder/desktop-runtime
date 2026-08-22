@@ -103,6 +103,20 @@ async fn handle_conn(
         return Ok(());
     }
 
+    // 非 GET/HEAD/POST 方法（SUBSCRIBE/UNSUBSCRIBE/NOTIFY/M-SEARCH 等）打日志：
+    // 用于确认客户端是否在做 UPnP 事件订阅（GENA LastChange）——部分 DLNA 客户端
+    // （抖音/乐播等）靠事件驱动进度条，轮询仅作校验；我们目前不实现订阅（返回 501），
+    // 若日志出现 SUBSCRIBE 即证明客户端在等事件。
+    if method != "POST" {
+        let brief: String = req
+            .lines()
+            .take(8)
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        eprintln!("[dlna_http_req] method={method} path={path} from={peer} head=[{brief}]");
+    }
+
     if method == "POST" {
         match soap::parse_soap(&body) {
             Some(parsed) => {
@@ -175,8 +189,11 @@ async fn write_response(
     // UPnP Device Architecture 强制：所有 HTTP 响应必须携带值为空的 EXT: 头。
     // 缺失时部分严格客户端（iOS / 抖音等）会丢弃 SOAP 响应体 → 投屏乐观成功（客户端
     // 不看响应）但进度条/状态永远不更新（客户端轮询响应被丢弃）。
+    // Server 头按 UPnP 规范格式：OS/version UPnP/1.1 product/version（部分客户端校验格式）。
+    // Date 头为 HTTP/1.1 规范强制（RFC 7231），Apple 严格客户端缺 Date 会拒绝解析响应体。
+    let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
     let header = format!(
-        "HTTP/1.1 {status} {text}\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\nEXT:\r\nServer: QuickApp-DLNA/1.0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {text}\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\nDate: {date}\r\nEXT:\r\nServer: Linux/6.0 UPnP/1.1 QuickApp-DLNA/1.0\r\nConnection: close\r\n\r\n",
         status = status,
         text = status_text,
         ct = content_type,
