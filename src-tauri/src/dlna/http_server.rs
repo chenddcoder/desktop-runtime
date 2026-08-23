@@ -44,6 +44,11 @@ pub async fn run_http(
     Ok(())
 }
 
+/// 查找请求头结束位置（\r\n\r\n 的起点；其 +4 即 body 起点），找不到返回 None。
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
 async fn handle_conn(
     mut stream: TcpStream,
     app: AppHandle,
@@ -51,126 +56,155 @@ async fn handle_conn(
     av: Arc<AvTransport>,
     peer: std::net::SocketAddr,
 ) -> std::io::Result<()> {
-    let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    let req = String::from_utf8_lossy(&buf[..n]);
+    // 跨请求读缓冲：支持 keep-alive（同一连接多个请求，Android OkHttp 连接池必需）。
+    // 之前实现只 read 一次 + Connection: close：TCP 不保证一次 read 拿到完整请求，
+    // 网络抖动时第一次 read 只有部分数据 → 头/body 解析失败 → 500 → 客户端该轮
+    // 进度丢失（间歇性"有时候更新有时候不更新"）；且 close 破坏连接复用导致重试丢轮询。
+    let mut read_buf: Vec<u8> = Vec::with_capacity(16384);
+    let mut tmp = [0u8; 4096];
 
-    let first_line = match req.lines().next() {
-        Some(l) => l,
-        None => return Ok(()),
-    };
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return Ok(());
-    }
-    let method = parts[0];
-    let path = parts[1];
-
-    // 解析 Content-Length（POST 需要）
-    let mut content_length = 0usize;
-    for line in req.lines() {
-        if let Some(v) = line.trim().strip_prefix("Content-Length:") {
-            content_length = v.trim().parse().unwrap_or(0);
-        }
-    }
-
-    // 提取 body（\r\n\r\n 之后），不足则继续读
-    let body = match req.find("\r\n\r\n") {
-        Some(i) => {
-            let start = i + 4;
-            let mut body = req[start..].to_string();
-            while body.len() < content_length {
-                let mut chunk = [0u8; 4096];
-                let cn = stream.read(&mut chunk).await?;
-                if cn == 0 {
-                    break;
-                }
-                body.push_str(&String::from_utf8_lossy(&chunk[..cn]));
+    loop {
+        // ---- 1. 循环读，直到拿到完整请求头（以 \r\n\r\n 结束）----
+        let header_end = loop {
+            if let Some(i) = find_header_end(&read_buf) {
+                break i;
             }
-            body
-        }
-        None => String::new(),
-    };
-
-    if method == "GET" || method == "HEAD" {
-        match desc.handle(path) {
-            Some((b, ct)) => write_response(&mut stream, 200, &ct, &b).await?,
-            None => write_response(&mut stream, 404, "text/plain", "Not found").await?,
-        }
-        return Ok(());
-    }
-
-    // 非 GET/HEAD/POST 方法（SUBSCRIBE/UNSUBSCRIBE/NOTIFY/M-SEARCH 等）打日志：
-    // 用于确认客户端是否在做 UPnP 事件订阅（GENA LastChange）——部分 DLNA 客户端
-    // （抖音/乐播等）靠事件驱动进度条，轮询仅作校验；我们目前不实现订阅（返回 501），
-    // 若日志出现 SUBSCRIBE 即证明客户端在等事件。
-    if method != "POST" {
-        let brief: String = req
-            .lines()
-            .take(8)
-            .map(|l| l.trim().to_string())
-            .collect::<Vec<_>>()
-            .join(" | ");
-        eprintln!("[dlna_http_req] method={method} path={path} from={peer} head=[{brief}]");
-    }
-
-    if method == "POST" {
-        match soap::parse_soap(&body) {
-            Some(parsed) => {
-                // 请求日志：记录每个 SOAP 动作与来源客户端 IP。
-                // MetaData 字段可能携带巨大 XML（抖音投屏会带视频元数据），摘要时剔除防刷屏。
-                let mut brief: Vec<String> = Vec::new();
-                for (k, v) in &parsed.params {
-                    if k.ends_with("MetaData") || k == "MetaData" {
-                        continue;
-                    }
-                    brief.push(format!("{k}={}", if v.len() > 60 { &v[..60] } else { v }));
-                }
-                eprintln!(
-                    "[dlna_soap_req] action={} from={} params=[{}]",
-                    parsed.action,
-                    peer,
-                    brief.join(" ")
-                );
-                let outcome = soap::handle_action(&parsed.action, &parsed.params, &av);
-                let resp_params = soap::response_params(&parsed.action, &av);
-                let xml = soap::build_soap_response(&parsed.action, &parsed.service_type, &resp_params);
-                // 响应体摘要（截断防刷屏）：用于核对客户端实际收到的 XML 结构是否合规。
-                let flat: String = xml.chars().filter(|c| !c.is_whitespace()).take(160).collect();
-                eprintln!("[dlna_soap_resp] body={flat}...");
-                match outcome {
-                    soap::ActionOutcome::Play(url) => {
-                        // 通知前端：有人把视频投到这台桌面电脑了
-                        let _ = app.emit("dlna://play", serde_json::json!({ "url": url }));
-                    }
-                    soap::ActionOutcome::Seek(secs) => {
-                        // 手机端拖动进度 → 前端 <video> 跟随跳转
-                        let _ = app.emit("dlna://seek", serde_json::json!({ "position": secs }));
-                    }
-                    soap::ActionOutcome::Stop => {
-                        // 手机端停止投屏 → 前端收起全屏播放层
-                        let _ = app.emit("dlna://stop", serde_json::json!({}));
-                    }
-                    soap::ActionOutcome::Pause => {
-                        let _ = app.emit("dlna://pause", serde_json::json!({}));
-                    }
-                    _ => {}
-                }
-                write_response(&mut stream, 200, "text/xml; charset=\"utf-8\"", &xml).await?;
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                return Ok(()); // 客户端关闭
             }
-            None => {
-                let err = soap::build_soap_error(401, "Invalid SOAP request");
-                write_response(&mut stream, 500, "text/xml; charset=\"utf-8\"", &err).await?;
+            read_buf.extend_from_slice(&tmp[..n]);
+            if read_buf.len() > 256 * 1024 {
+                return Ok(()); // 异常大请求，放弃（防恶意）
+            }
+        };
+
+        let head_str = String::from_utf8_lossy(&read_buf[..header_end]).into_owned();
+        let first_line = head_str.lines().next().unwrap_or("").to_string();
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() < 2 {
+            return Ok(());
+        }
+        let method = parts[0].to_string();
+        let path = parts[1].to_string();
+
+        // 解析头：Content-Length / Connection
+        let mut content_length = 0usize;
+        let mut conn_keep_alive = false;
+        let mut has_conn_header = false;
+        for line in head_str.lines().skip(1) {
+            let t = line.trim();
+            let lower = t.to_ascii_lowercase();
+            if let Some(v) = t.strip_prefix("Content-Length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            } else if lower.starts_with("connection:") {
+                has_conn_header = true;
+                let v = lower.strip_prefix("connection:").unwrap_or("").trim();
+                // HTTP/1.1 默认 keep-alive；显式 close 才关闭
+                conn_keep_alive = !v.contains("close");
             }
         }
-        return Ok(());
-    }
+        // 无 Connection 头：HTTP/1.1 默认 keep-alive
+        if !has_conn_header {
+            conn_keep_alive = true;
+        }
 
-    write_response(&mut stream, 501, "text/plain", "Not implemented").await?;
-    Ok(())
+        // ---- 2. 按 Content-Length 读完整 body ----
+        let body_start = header_end + 4;
+        while read_buf.len() < body_start + content_length {
+            let n = stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            read_buf.extend_from_slice(&tmp[..n]);
+        }
+        let body_end = std::cmp::min(read_buf.len(), body_start + content_length);
+        let body = String::from_utf8_lossy(&read_buf[body_start..body_end]).to_string();
+        // 消费本请求数据
+        read_buf.drain(..body_end);
+
+        // ---- 3. 处理请求 ----
+        if method == "GET" || method == "HEAD" {
+            match desc.handle(&path) {
+                Some((b, ct)) => {
+                    write_response(&mut stream, 200, &ct, &b, conn_keep_alive).await?
+                }
+                None => {
+                    write_response(&mut stream, 404, "text/plain", "Not found", conn_keep_alive).await?
+                }
+            }
+        } else if method == "POST" {
+            match soap::parse_soap(&body) {
+                Some(parsed) => {
+                    // 请求日志：记录每个 SOAP 动作与来源客户端 IP。
+                    // MetaData 字段可能携带巨大 XML（抖音投屏会带视频元数据），摘要时剔除防刷屏。
+                    let mut brief: Vec<String> = Vec::new();
+                    for (k, v) in &parsed.params {
+                        if k.ends_with("MetaData") || k == "MetaData" {
+                            continue;
+                        }
+                        brief.push(format!("{k}={}", if v.len() > 60 { &v[..60] } else { v }));
+                    }
+                    eprintln!(
+                        "[dlna_soap_req] action={} from={} params=[{}]",
+                        parsed.action,
+                        peer,
+                        brief.join(" ")
+                    );
+                    let outcome = soap::handle_action(&parsed.action, &parsed.params, &av);
+                    let resp_params = soap::response_params(&parsed.action, &av);
+                    let xml =
+                        soap::build_soap_response(&parsed.action, &parsed.service_type, &resp_params);
+                    // 响应体摘要（截断防刷屏）：用于核对客户端实际收到的 XML 结构是否合规。
+                    let flat: String = xml.chars().filter(|c| !c.is_whitespace()).take(160).collect();
+                    eprintln!("[dlna_soap_resp] body={flat}...");
+                    match outcome {
+                        soap::ActionOutcome::Play(url) => {
+                            // 通知前端：有人把视频投到这台桌面电脑了
+                            let _ = app.emit("dlna://play", serde_json::json!({ "url": url }));
+                        }
+                        soap::ActionOutcome::Seek(secs) => {
+                            // 手机端拖动进度 → 前端 <video> 跟随跳转
+                            let _ = app.emit("dlna://seek", serde_json::json!({ "position": secs }));
+                        }
+                        soap::ActionOutcome::Stop => {
+                            // 手机端停止投屏 → 前端收起全屏播放层
+                            let _ = app.emit("dlna://stop", serde_json::json!({}));
+                        }
+                        soap::ActionOutcome::Pause => {
+                            let _ = app.emit("dlna://pause", serde_json::json!({}));
+                        }
+                        _ => {}
+                    }
+                    write_response(&mut stream, 200, "text/xml; charset=\"utf-8\"", &xml, conn_keep_alive)
+                        .await?;
+                }
+                None => {
+                    let err = soap::build_soap_error(401, "Invalid SOAP request");
+                    write_response(&mut stream, 500, "text/xml; charset=\"utf-8\"", &err, conn_keep_alive)
+                        .await?;
+                }
+            }
+        } else {
+            // 非 GET/POST 方法（SUBSCRIBE/UNSUBSCRIBE/NOTIFY/M-SEARCH 等）打日志：
+            // 用于确认客户端是否在做 UPnP 事件订阅（GENA LastChange）——部分 DLNA 客户端
+            // （抖音/乐播等）靠事件驱动进度条，轮询仅作校验；我们目前不实现订阅（返回 501），
+            // 若日志出现 SUBSCRIBE 即证明客户端在等事件。
+            let brief: String = head_str
+                .lines()
+                .take(8)
+                .map(|l| l.trim().to_string())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            eprintln!("[dlna_http_req] method={method} path={path} from={peer} head=[{brief}]");
+            write_response(&mut stream, 501, "text/plain", "Not implemented", conn_keep_alive).await?;
+        }
+
+        // ---- 4. keep-alive：继续处理同一连接的下一个请求；close 则结束 ----
+        if !conn_keep_alive {
+            return Ok(());
+        }
+    }
 }
 
 async fn write_response(
@@ -178,6 +212,7 @@ async fn write_response(
     status: u16,
     content_type: &str,
     body: &str,
+    keep_alive: bool,
 ) -> std::io::Result<()> {
     let status_text = match status {
         200 => "OK",
@@ -191,9 +226,11 @@ async fn write_response(
     // 不看响应）但进度条/状态永远不更新（客户端轮询响应被丢弃）。
     // Server 头按 UPnP 规范格式：OS/version UPnP/1.1 product/version（部分客户端校验格式）。
     // Date 头为 HTTP/1.1 规范强制（RFC 7231），Apple 严格客户端缺 Date 会拒绝解析响应体。
+    // Connection 头跟随客户端：keep-alive 复用连接（Android OkHttp 连接池），close 关闭。
     let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    let conn = if keep_alive { "keep-alive" } else { "close" };
     let header = format!(
-        "HTTP/1.1 {status} {text}\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\nDate: {date}\r\nEXT:\r\nServer: Linux/6.0 UPnP/1.1 QuickApp-DLNA/1.0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {text}\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\nDate: {date}\r\nEXT:\r\nServer: Linux/6.0 UPnP/1.1 QuickApp-DLNA/1.0\r\nConnection: {conn}\r\n\r\n",
         status = status,
         text = status_text,
         ct = content_type,

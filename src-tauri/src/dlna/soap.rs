@@ -52,12 +52,22 @@ fn param_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"<([a-zA-Z_]\w*)>([^<]*)</([a-zA-Z_]\w*)>"#).unwrap())
 }
 
-/// DLNA 时间格式 H+:MM:SS（统一补零到 HH:MM:SS）。
-fn secs_to_hms(secs: u64) -> String {
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    format!("{h:02}:{m:02}:{s:02}")
+/// DLNA 时间格式 H+:MM:SS[.F+]（毫秒精度，AvTransport 内部按毫秒存储）。
+/// 毫秒为 0 输出整秒（00:00:05），毫秒>0 带小数（00:00:00.500）。
+/// 关键：之前整秒截断会让 <1s 的进度显示 00:00:00，客户端（Android 抖音）
+/// 持续看到 0 会误判"设备未播放"、进度条不更新——带毫秒小数后播放
+/// 0.5s 即可让 RelTime 非零，客户端立即确认设备在播。
+fn ms_to_hms(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let millis = ms % 1000;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if millis > 0 {
+        format!("{h:02}:{m:02}:{s:02}.{millis:03}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}")
+    }
 }
 
 fn escape_xml(s: &str) -> String {
@@ -180,7 +190,7 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
                 crate::dlna::av_transport::TransportState::NoMedia => "NO_MEDIA_PRESENT",
             };
             eprintln!(
-                "[dlna_soap_resp] GetTransportInfo -> CurrentTransportState={} pos={}s dur={}s",
+                "[dlna_soap_resp] GetTransportInfo -> CurrentTransportState={} pos={}ms dur={}ms",
                 st,
                 av.position(),
                 av.duration()
@@ -191,25 +201,43 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
         }
         "GetPositionInfo" => {
             // 关键修复：之前这里硬编码 0:00:00，客户端进度条永远停在 0、拖动后读回仍是 0。
-            // 现在用前端 <video> 上报进 AvTransport 的真实进度。
-            let pos = av.position();
+            // 现在用前端 <video> 上报进 AvTransport 的真实进度（毫秒）。
+            let mut pos = av.position();
             let dur = av.duration();
+            // 强制完成渐进逻辑（TV 下键/手动切集，前端发 force_complete 信号）：
+            // 抖音客户端有"先确认在播（上次回报进度>1s）再接受播完信号"的判断，
+            // 直接返回总时长在进度<1s 时会被忽略、不切集。
+            //   - 上次回报 ≥1s（客户端已确认在播）→ 本次返回总时长，播完信号发出，清标志
+            //   - 上次回报 <1s（客户端未确认在播）→ 本次先给一个 >1s 过渡值（2s，
+            //     短于 2s 的剧直接给总时长），保持标志，下次轮询再返回总时长
+            if av.force_complete() && dur > 0 {
+                let last = av.last_reported();
+                if last >= 1000 {
+                    pos = dur;
+                    av.clear_force_complete();
+                } else {
+                    let transition = if dur >= 2000 { 2000 } else { dur };
+                    pos = pos.max(transition);
+                }
+            }
+            av.set_last_reported(pos);
             let uri = av.track_uri();
             let meta = av.track_meta_data();
             eprintln!(
-                "[dlna_soap_resp] GetPositionInfo -> RelTime={} TrackDuration={} (pos={pos}s dur={dur}s) TrackURI={uri:?} TrackMetaData.len={}",
-                secs_to_hms(pos),
-                secs_to_hms(dur),
+                "[dlna_soap_resp] GetPositionInfo -> RelTime={} TrackDuration={} (pos={pos}ms dur={dur}ms force_complete={}) TrackURI={uri:?} TrackMetaData.len={}",
+                ms_to_hms(pos),
+                ms_to_hms(dur),
+                av.force_complete(),
                 meta.len()
             );
             m.insert("Track".into(), "1".into());
-            m.insert("TrackDuration".into(), secs_to_hms(dur));
+            m.insert("TrackDuration".into(), ms_to_hms(dur));
             // 回传投屏时携带的 DIDL-Lite 元数据（规范要求与 SetAVTransportURI 一致；
             // 之前恒为空，抖音等客户端校验失败会丢弃整个响应 → 进度条/下一集判断失效）。
             m.insert("TrackMetaData".into(), meta);
             m.insert("TrackURI".into(), uri);
-            m.insert("RelTime".into(), secs_to_hms(pos));
-            m.insert("AbsTime".into(), secs_to_hms(pos));
+            m.insert("RelTime".into(), ms_to_hms(pos));
+            m.insert("AbsTime".into(), ms_to_hms(pos));
             m.insert("RelCount".into(), "0".into());
             m.insert("AbsCount".into(), "0".into());
         }
@@ -378,13 +406,82 @@ mod tests {
     fn get_position_info_returns_real_progress() {
         let av = crate::dlna::av_transport::AvTransport::new();
         av.set_uri("http://x/v.mp4", "");
-        av.update_position(90); // 1:30
-        av.update_duration(600); // 10:00
+        av.update_position(90_000); // 1:30（毫秒）
+        av.update_duration(600_000); // 10:00（毫秒）
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:01:30"));
         assert_eq!(m.get("AbsTime").map(|s| s.as_str()), Some("00:01:30"));
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:10:00"));
         assert_eq!(m.get("TrackURI").map(|s| s.as_str()), Some("http://x/v.mp4"));
         assert_eq!(m.get("Track").map(|s| s.as_str()), Some("1"));
+    }
+
+    /// 毫秒精度验证：<1s 的进度必须输出非零 RelTime（客户端判定"在播"的关键）。
+    #[test]
+    fn position_below_one_second_is_not_truncated_to_zero() {
+        let av = crate::dlna::av_transport::AvTransport::new();
+        av.set_uri("http://x/v.mp4", "");
+        av.update_position(500); // 0.5s
+        av.update_duration(16_000); // 16s
+        let m = response_params("GetPositionInfo", &av);
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:00.500"));
+        assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:16"));
+        // 0 值仍是纯整秒 00:00:00
+        av.update_position(0);
+        let m = response_params("GetPositionInfo", &av);
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:00"));
+    }
+
+    /// 换源（切集）后 duration 必须清零，避免残留上一集时长被客户端校验丢弃。
+    #[test]
+    fn set_uri_resets_duration() {
+        let av = crate::dlna::av_transport::AvTransport::new();
+        av.update_duration(29_000);
+        av.set_uri("http://x/v2.mp4", "");
+        assert_eq!(av.duration(), 0);
+        assert_eq!(av.position(), 0);
+    }
+
+    /// 强制完成渐进逻辑：客户端上次回报 <1s（未确认在播）→ 先返回 2s 过渡值
+    /// 确认在播，保持标志；下次轮询再返回总时长并清除标志。
+    #[test]
+    fn force_complete_progressive_when_client_below_one_second() {
+        let av = crate::dlna::av_transport::AvTransport::new();
+        av.set_uri("http://x/v.mp4", "");
+        av.update_duration(29_000);
+        av.set_force_complete();
+        // 第一次轮询：last_reported=0（<1s）→ 返回 2s 过渡值，标志保持
+        let m = response_params("GetPositionInfo", &av);
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:02"));
+        assert!(av.force_complete(), "过渡后标志应保持，等待下次轮询返回总时长");
+        // 第二次轮询：last_reported=2000（≥1s）→ 返回总时长 29s，标志清除
+        let m = response_params("GetPositionInfo", &av);
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:29"));
+        assert!(!av.force_complete(), "返回总时长后标志应清除");
+    }
+
+    /// 强制完成：客户端已确认在播（上次回报 ≥1s）→ 直接返回总时长。
+    #[test]
+    fn force_complete_direct_when_client_playing() {
+        let av = crate::dlna::av_transport::AvTransport::new();
+        av.set_uri("http://x/v.mp4", "");
+        av.update_duration(29_000);
+        av.update_position(5_000);
+        // 正常轮询一次，让 last_reported=5s（客户端已确认在播）
+        response_params("GetPositionInfo", &av);
+        av.set_force_complete();
+        let m = response_params("GetPositionInfo", &av);
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:29"));
+        assert!(!av.force_complete());
+    }
+
+    /// 换源（切集）清除强制完成信号与上次回报进度。
+    #[test]
+    fn set_uri_clears_force_complete() {
+        let av = crate::dlna::av_transport::AvTransport::new();
+        av.set_force_complete();
+        av.set_uri("http://x/v2.mp4", "");
+        assert!(!av.force_complete());
+        assert_eq!(av.last_reported(), 0);
     }
 }

@@ -19,8 +19,20 @@ pub struct AvTransport {
     /// SetAVTransportURI 携带的 DIDL-Lite 元数据（抖音等客户端会校验
     /// GetPositionInfo 返回的 TrackMetaData 与投屏时传入的一致，空则丢弃响应）。
     track_meta_data: Mutex<String>,
+    /// 播放进度（毫秒）。前端上报即毫秒；GetPositionInfo 输出 RelTime 时
+    /// 转 H+:MM:SS[.F+]（毫秒小数），避免 <1s 的进度被截断成 0 导致
+    /// 客户端（Android 抖音等）误判"设备未播放"、进度条不更新。
     position: Mutex<u64>,
+    /// 总时长（毫秒）。
     duration: Mutex<u64>,
+    /// 强制完成信号（TV 下键/手动切集）：客户端（抖音）有"先确认在播
+    /// （进度>1s）再接受播完信号"的判断逻辑，直接返回总时长在进度<1s 时
+    /// 会被忽略。GetPositionInfo 响应时做渐进处理：上次返回 <1s → 先给
+    /// 一个 >1s 过渡值确认在播，下次轮询再返回总时长；上次 ≥1s → 直接返回总时长。
+    force_complete: Mutex<bool>,
+    /// 上次 GetPositionInfo 返回给客户端的 RelTime（毫秒），用于判断客户端
+    /// 是否已确认在播。换源（SetAVTransportURI）时清零。
+    last_reported: Mutex<u64>,
 }
 
 #[allow(dead_code)]
@@ -32,6 +44,8 @@ impl AvTransport {
             track_meta_data: Mutex::new(String::new()),
             position: Mutex::new(0),
             duration: Mutex::new(0),
+            force_complete: Mutex::new(false),
+            last_reported: Mutex::new(0),
         }
     }
 
@@ -71,6 +85,12 @@ impl AvTransport {
         *self.track_uri.lock().unwrap() = uri.to_string();
         *self.track_meta_data.lock().unwrap() = meta_data.to_string();
         *self.position.lock().unwrap() = 0;
+        // 关键：换源时一并清空 duration，避免新集 TrackDuration 短暂残留
+        // 上一集时长，与 TrackMetaData 不一致被客户端（抖音）校验丢弃。
+        *self.duration.lock().unwrap() = 0;
+        // 新集开始：清强制完成信号与上次回报进度（客户端在新集重新确认在播）
+        *self.force_complete.lock().unwrap() = false;
+        *self.last_reported.lock().unwrap() = 0;
         *self.state.lock().unwrap() = TransportState::Stopped;
     }
 
@@ -101,29 +121,56 @@ impl AvTransport {
         false
     }
 
+    /// SOAP Seek 传入的是秒（客户端拖动进度），内部按毫秒存储。
     pub fn seek(&self, position_seconds: u64) -> bool {
         let s = self.state();
         if s == TransportState::Playing || s == TransportState::Paused {
-            *self.position.lock().unwrap() = position_seconds;
+            *self.position.lock().unwrap() = position_seconds.saturating_mul(1000);
             return true;
         }
         false
     }
 
-    pub fn update_position(&self, seconds: u64) {
-        *self.position.lock().unwrap() = seconds;
+    /// 更新播放进度（毫秒）。
+    pub fn update_position(&self, position_ms: u64) {
+        *self.position.lock().unwrap() = position_ms;
     }
 
-    pub fn update_duration(&self, seconds: u64) {
-        *self.duration.lock().unwrap() = seconds;
+    /// 更新总时长（毫秒）。
+    pub fn update_duration(&self, duration_ms: u64) {
+        *self.duration.lock().unwrap() = duration_ms;
     }
 
-    /// 供 GetPositionInfo / 前端进度回传读取当前播放进度（秒）。
+    /// 设置强制完成信号（TV 下键/手动切集）：GetPositionInfo 将渐进把进度导向总时长。
+    pub fn set_force_complete(&self) {
+        *self.force_complete.lock().unwrap() = true;
+    }
+
+    /// 强制完成信号已发出（GetPositionInfo 返回总时长后清除）。
+    pub fn clear_force_complete(&self) {
+        *self.force_complete.lock().unwrap() = false;
+    }
+
+    pub fn force_complete(&self) -> bool {
+        *self.force_complete.lock().unwrap()
+    }
+
+    /// 记录本次 GetPositionInfo 返回给客户端的 RelTime（毫秒）。
+    pub fn set_last_reported(&self, ms: u64) {
+        *self.last_reported.lock().unwrap() = ms;
+    }
+
+    /// 上次 GetPositionInfo 返回给客户端的 RelTime（毫秒）。
+    pub fn last_reported(&self) -> u64 {
+        *self.last_reported.lock().unwrap()
+    }
+
+    /// 供 GetPositionInfo / 前端进度回传读取当前播放进度（毫秒）。
     pub fn position(&self) -> u64 {
         *self.position.lock().unwrap()
     }
 
-    /// 供 GetPositionInfo 读取总时长（秒）。
+    /// 供 GetPositionInfo 读取总时长（毫秒）。
     pub fn duration(&self) -> u64 {
         *self.duration.lock().unwrap()
     }
@@ -146,6 +193,8 @@ impl AvTransport {
         *self.track_meta_data.lock().unwrap() = String::new();
         *self.position.lock().unwrap() = 0;
         *self.duration.lock().unwrap() = 0;
+        *self.force_complete.lock().unwrap() = false;
+        *self.last_reported.lock().unwrap() = 0;
     }
 }
 

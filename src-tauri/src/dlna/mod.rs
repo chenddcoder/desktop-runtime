@@ -302,7 +302,8 @@ pub fn dlna_report_position(position: u64, duration: u64, playing: bool, paused:
 ///   position {position: ms} → 更新真实进度（GetPositionInfo RelTime）
 ///   duration {duration: ms} → 更新总时长（GetPositionInfo TrackDuration）
 ///   next 等其它事件 → 仅日志（DLNA 协议无 next 概念，客户端通过 SetAVTransportURI 换源）
-/// 注意：快应用侧 position/duration 均为**毫秒**，AvTransport 内部按**秒**存储。
+/// 注意：快应用侧 position/duration 均为**毫秒**，AvTransport 内部也按**毫秒**存储
+/// （RelTime 输出带毫秒小数，避免 <1s 进度被截断成 0 导致客户端误判未播放）。
 #[tauri::command]
 pub fn dlna_send_remote_event(
     app: tauri::AppHandle,
@@ -320,23 +321,32 @@ pub fn dlna_send_remote_event(
         }
     };
     let num_field = |key: &str| -> Option<u64> {
-        data.get(key)
-            .and_then(|v| v.as_u64())
-            .map(|ms| ms / 1000) // 毫秒 → 秒
+        // position/duration 直接存毫秒（AvTransport 内部即毫秒存储）：
+        // 之前 ms/1000 整数除法会把 <1s 的上报截断成 0 → RelTime 恒为
+        // 00:00:00 → 客户端（Android 抖音）判定"未播放"、进度条不更新。
+        data.get(key).and_then(|v| v.as_u64())
     };
     match event_name.as_str() {
         "play" => av.update_playback(true, false),
         "pause" => av.update_playback(false, true),
         "stop" => av.update_playback(false, false),
         "position" => {
-            if let Some(secs) = num_field("position") {
-                av.update_position(secs);
+            if let Some(ms) = num_field("position") {
+                av.update_position(ms);
             }
         }
         "duration" => {
-            if let Some(secs) = num_field("duration") {
-                av.update_duration(secs);
+            if let Some(ms) = num_field("duration") {
+                av.update_duration(ms);
             }
+        }
+        // TV 下键/手动切集：设置强制完成信号。客户端（抖音）有"先确认在播
+        // （进度>1s）再接受播完"的判断逻辑——GetPositionInfo 响应时渐进处理：
+        // 上次回报 <1s → 先给 >1s 过渡值确认在播，下次轮询再返回总时长；
+        // 上次 ≥1s → 直接返回总时长（客户端判定播完 → SetAVTransportURI 切集）。
+        // 不再由前端直接上报 position=duration（上层感知不到客户端轮询节奏）。
+        "force_complete" => {
+            av.set_force_complete();
         }
         // 快应用 DLNA 就绪：通知 webview 侧（dlna_overlay.js）补发缓存的投屏请求。
         // 不依赖 window 全局信号，走 Rust → overlay 事件（对齐真机原生广播语义）。
