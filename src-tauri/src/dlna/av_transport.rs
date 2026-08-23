@@ -28,8 +28,13 @@ pub struct AvTransport {
     /// 强制完成信号（TV 下键/手动切集）：客户端（抖音）有"先确认在播
     /// （进度>1s）再接受播完信号"的判断逻辑，直接返回总时长在进度<1s 时
     /// 会被忽略。GetPositionInfo 响应时做渐进处理：上次返回 <1s → 先给
-    /// 一个 >1s 过渡值确认在播，下次轮询再返回总时长；上次 ≥1s → 直接返回总时长。
+    /// 一个 >1s 过渡值确认在播，之后**持续返回总时长**（不能只返回一次——
+    /// 下一轮回退到真实进度会被抖音判定"设备异常/进度倒退"而不切集）；
+    /// 直到客户端 SetAVTransportURI 换集（set_uri 清标志）或超时自动清除。
     force_complete: Mutex<bool>,
+    /// 强制完成信号的触发时刻，用于超时兜底（防止客户端一直不切集导致
+    /// 进度永久锁死在"播完"状态）。
+    force_complete_at: Mutex<Option<std::time::Instant>>,
     /// 上次 GetPositionInfo 返回给客户端的 RelTime（毫秒），用于判断客户端
     /// 是否已确认在播。换源（SetAVTransportURI）时清零。
     last_reported: Mutex<u64>,
@@ -45,6 +50,7 @@ impl AvTransport {
             position: Mutex::new(0),
             duration: Mutex::new(0),
             force_complete: Mutex::new(false),
+            force_complete_at: Mutex::new(None),
             last_reported: Mutex::new(0),
         }
     }
@@ -90,6 +96,7 @@ impl AvTransport {
         *self.duration.lock().unwrap() = 0;
         // 新集开始：清强制完成信号与上次回报进度（客户端在新集重新确认在播）
         *self.force_complete.lock().unwrap() = false;
+        *self.force_complete_at.lock().unwrap() = None;
         *self.last_reported.lock().unwrap() = 0;
         *self.state.lock().unwrap() = TransportState::Stopped;
     }
@@ -144,15 +151,26 @@ impl AvTransport {
     /// 设置强制完成信号（TV 下键/手动切集）：GetPositionInfo 将渐进把进度导向总时长。
     pub fn set_force_complete(&self) {
         *self.force_complete.lock().unwrap() = true;
+        *self.force_complete_at.lock().unwrap() = Some(std::time::Instant::now());
     }
 
-    /// 强制完成信号已发出（GetPositionInfo 返回总时长后清除）。
+    /// 强制完成信号已发出（换集/超时后清除）。
     pub fn clear_force_complete(&self) {
         *self.force_complete.lock().unwrap() = false;
+        *self.force_complete_at.lock().unwrap() = None;
     }
 
     pub fn force_complete(&self) -> bool {
         *self.force_complete.lock().unwrap()
+    }
+
+    /// 强制完成信号是否已超时（客户端一直不切集时自动清除，防止进度永久锁死在播完）。
+    pub fn force_complete_expired(&self, timeout: std::time::Duration) -> bool {
+        let at = self.force_complete_at.lock().unwrap();
+        match *at {
+            Some(t) => t.elapsed() > timeout,
+            None => false,
+        }
     }
 
     /// 记录本次 GetPositionInfo 返回给客户端的 RelTime（毫秒）。
@@ -194,6 +212,7 @@ impl AvTransport {
         *self.position.lock().unwrap() = 0;
         *self.duration.lock().unwrap() = 0;
         *self.force_complete.lock().unwrap() = false;
+        *self.force_complete_at.lock().unwrap() = None;
         *self.last_reported.lock().unwrap() = 0;
     }
 }
