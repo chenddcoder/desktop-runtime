@@ -340,12 +340,13 @@ pub fn dlna_send_remote_event(
                 av.update_duration(ms);
             }
         }
-        // TV 下键/手动切集：设置强制完成信号。客户端（抖音）有"先确认在播
-        // （进度>1s）再接受播完"的判断逻辑——GetPositionInfo 响应时渐进处理：
-        // 上次回报 <1s → 先给 >1s 过渡值确认在播，下次轮询再返回总时长；
-        // 上次 ≥1s → 直接返回总时长（客户端判定播完 → SetAVTransportURI 切集）。
-        // 不再由前端直接上报 position=duration（上层感知不到客户端轮询节奏）。
-        "force_complete" => {
+        // TV 下键/手动切集：复用 xiaoyoucast 契约的 next 事件（不新增事件名）。
+        // 客户端（抖音）有"先确认在播（进度>1s）再接受播完"的判断逻辑——
+        // GetPositionInfo 响应时渐进处理：上次回报 <1s → 先给 >1s 过渡值确认
+        // 在播，之后**持续返回总时长**（不能只返回一次——下一轮回退到真实进度
+        // 会被抖音判定"进度倒退"而不切集），直到客户端 SetAVTransportURI 换集
+        // （set_uri 清标志）或 20s 超时兜底。
+        "next" => {
             av.set_force_complete();
         }
         // 快应用 DLNA 就绪：通知 webview 侧（dlna_overlay.js）补发缓存的投屏请求。
@@ -353,7 +354,7 @@ pub fn dlna_send_remote_event(
         "tvcast_ready" => {
             let _ = app.emit("dlna://app-ready", serde_json::json!({}));
         }
-        // next / heartbeat_response / tv_cmd / addDeviceEvent / sendInfoToAndroidCastEvent 等
+        // heartbeat_response / tv_cmd / addDeviceEvent / sendInfoToAndroidCastEvent 等
         // 在桌面 DLNA 场景无对应能力，仅记录日志，不影响状态机。
         _ => {}
     }

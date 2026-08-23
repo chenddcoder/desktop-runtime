@@ -44,9 +44,26 @@ pub async fn run_http(
     Ok(())
 }
 
-/// 查找请求头结束位置（\r\n\r\n 的起点；其 +4 即 body 起点），找不到返回 None。
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
+/// 查找请求头结束位置，返回 (header_end, 分隔符长度)：
+/// header_end 是 \r\n\r\n（标准）或 \n\n（LF-only，部分 DLNA 客户端/乐播 SDK）
+/// 的**起点**；body 起点 = header_end + 分隔符长度（\r\n\r\n=4，\n\n=2）。
+/// 找不到返回 None。
+fn find_header_end(buf: &[u8]) -> Option<(usize, usize)> {
+    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((i, 4));
+    }
+    if let Some(i) = buf.windows(2).position(|w| w == b"\n\n") {
+        return Some((i, 2));
+    }
+    None
+}
+
+/// 判断 HTTP 方法 token 是否合法（用于校验请求行，跳过残留数据/解析错位）。
+fn is_http_method(tok: &str) -> bool {
+    matches!(
+        tok,
+        "GET" | "POST" | "HEAD" | "SUBSCRIBE" | "UNSUBSCRIBE" | "NOTIFY" | "OPTIONS" | "PUT" | "DELETE" | "M-SEARCH"
+    )
 }
 
 async fn handle_conn(
@@ -64,18 +81,34 @@ async fn handle_conn(
     let mut tmp = [0u8; 4096];
 
     loop {
-        // ---- 1. 循环读，直到拿到完整请求头（以 \r\n\r\n 结束）----
-        let header_end = loop {
-            if let Some(i) = find_header_end(&read_buf) {
-                break i;
-            }
-            let n = stream.read(&mut tmp).await?;
-            if n == 0 {
-                return Ok(()); // 客户端关闭
-            }
-            read_buf.extend_from_slice(&tmp[..n]);
-            if read_buf.len() > 256 * 1024 {
-                return Ok(()); // 异常大请求，放弃（防恶意）
+        // ---- 1. 循环读 + 定位真正的请求行 ----
+        // 校验头部首行是否为合法 HTTP 方法：若 read_buf 开头是残留数据
+        // （上一次请求 body 未消费/头解析错位，如 LF-only 头 + content-length
+        // 大小写不匹配），丢弃该段继续找，避免 method 被解析成 SOAP body 内容
+        // （method=<s:Envelope → 投屏/进度全部失效）。
+        let (header_end, sep_len) = loop {
+            match find_header_end(&read_buf) {
+                Some((i, sep)) => {
+                    let head = String::from_utf8_lossy(&read_buf[..i]);
+                    let first = head.lines().next().unwrap_or("");
+                    let tok = first.split_whitespace().next().unwrap_or("");
+                    if is_http_method(tok) {
+                        break (i, sep);
+                    }
+                    // 残留/错位数据：丢弃到该段结束，继续找真正的请求行
+                    eprintln!("[dlna_http] skip stale head: tok={tok:?}");
+                    read_buf.drain(..i + sep);
+                }
+                None => {
+                    let n = stream.read(&mut tmp).await?;
+                    if n == 0 {
+                        return Ok(()); // 客户端关闭
+                    }
+                    read_buf.extend_from_slice(&tmp[..n]);
+                    if read_buf.len() > 256 * 1024 {
+                        return Ok(()); // 异常大请求，放弃（防恶意）
+                    }
+                }
             }
         };
 
@@ -88,14 +121,14 @@ async fn handle_conn(
         let method = parts[0].to_string();
         let path = parts[1].to_string();
 
-        // 解析头：Content-Length / Connection
+        // 解析头：Content-Length / Connection（HTTP 头大小写不敏感）
         let mut content_length = 0usize;
         let mut conn_keep_alive = false;
         let mut has_conn_header = false;
         for line in head_str.lines().skip(1) {
             let t = line.trim();
             let lower = t.to_ascii_lowercase();
-            if let Some(v) = t.strip_prefix("Content-Length:") {
+            if let Some(v) = lower.strip_prefix("content-length:") {
                 content_length = v.trim().parse().unwrap_or(0);
             } else if lower.starts_with("connection:") {
                 has_conn_header = true;
@@ -110,7 +143,7 @@ async fn handle_conn(
         }
 
         // ---- 2. 按 Content-Length 读完整 body ----
-        let body_start = header_end + 4;
+        let body_start = header_end + sep_len;
         while read_buf.len() < body_start + content_length {
             let n = stream.read(&mut tmp).await?;
             if n == 0 {
@@ -240,4 +273,46 @@ async fn write_response(
     stream.write_all(body.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_header_end_detects_crlf() {
+        // 标准 \r\n\r\n：返回 (起点, 4)
+        let buf = b"POST /x HTTP/1.1\r\nHost: a\r\n\r\nBODY";
+        let r = find_header_end(buf);
+        assert_eq!(r, Some((25, 4))); // \r\n\r\n 起点在 25
+    }
+
+    #[test]
+    fn find_header_end_detects_lf_only() {
+        // LF-only 头（部分 DLNA 客户端）：\n\n，返回 (起点, 2)
+        let buf = b"POST /x HTTP/1.1\nHost: a\n\nBODY";
+        let r = find_header_end(buf);
+        assert_eq!(r, Some((24, 2))); // \n\n 起点在 24
+    }
+
+    #[test]
+    fn find_header_end_prefers_crlf_over_lf() {
+        // 同时存在时 \r\n\r\n 优先匹配（\n\n 在 22，\r\n\r\n 在 24）——
+        // 若因此定位到 body 内的分隔符，由 handle_conn 的 is_http_method
+        // 请求行校验跳过残留段自愈。
+        let buf = b"POST /x HTTP/1.1\nH: a\n\nX\r\n\r\nBODY";
+        let r = find_header_end(buf);
+        assert_eq!(r, Some((24, 4)));
+    }
+
+    #[test]
+    fn http_method_tokens_validated() {
+        assert!(is_http_method("POST"));
+        assert!(is_http_method("GET"));
+        assert!(is_http_method("SUBSCRIBE"));
+        assert!(is_http_method("M-SEARCH"));
+        assert!(!is_http_method("<s:Envelope"));
+        assert!(!is_http_method("xmlns:s="));
+        assert!(!is_http_method(""));
+    }
 }
