@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod dlna;
+pub mod media_proxy;
 pub mod proxy;
 
 use tauri::{
@@ -52,6 +53,11 @@ const DLNA_OVERLAY_JS: &str = include_str!("../dlna_overlay.js");
 const UI_SCALE_JS: &str = include_str!("../ui_scale.js");
 // 跨域代理注入（绕过浏览器 CORS，让 es_pkg 的 resolve / zip 下载走 Rust reqwest）。
 const PROXY_FETCH_JS: &str = include_str!("../proxy_fetch.js");
+// 回环流式媒体代理注入（hook video.src → 127.0.0.1:5200/media，解决抖音 302 调度 URL
+// 在 <video> 下每次 Range/重连/切集都重新 302 导致连续性断裂卡进度的问题）。
+const MEDIA_PROXY_JS: &str = include_str!("../media_proxy.js");
+// 媒体代理端口（须先于 MEDIA_PROXY_JS 注入，供其读取）
+const MEDIA_PROXY_PORT: u16 = 5200;
 
 // 默认加载的快应用配置（es-app.config.json，编译期注入）。
 // 想打包成另一个桌面应用（如天气），只改这个文件：{"esPackage":"cn.chenddcoder.weather","appName":"天气"}
@@ -100,6 +106,8 @@ fn main() {
                 "window.__ES_DEFAULT_PKG__ = {};",
                 serde_json::to_string(&es_pkg).unwrap_or_else(|_| "\"cn.chenddcoder.tvcast\"".into())
             );
+            // 媒体代理端口常量（须先于 MEDIA_PROXY_JS 执行）
+            let media_port_js = format!("window.__MEDIA_PROXY_PORT__ = {};", MEDIA_PROXY_PORT);
             eprintln!("[desktop-runtime] default es_pkg={es_pkg} appName={app_name}");
             let window = WebviewWindowBuilder::new(app, "main", url)
                 .title(&app_name)
@@ -113,6 +121,8 @@ fn main() {
                 .initialization_script(&es_pkg_js)
                 .initialization_script(UI_SCALE_JS)
                 .initialization_script(PROXY_FETCH_JS)
+                .initialization_script(&media_port_js)
+                .initialization_script(MEDIA_PROXY_JS)
                 .build()
                 .expect("failed to build main window");
 
@@ -247,6 +257,20 @@ fn main() {
                 };
                 let _ = dlna_emit.emit("dlna://status", payload);
             });
+
+            // ========== 回环流式媒体代理（抖音 302 调度 URL 连续性修复） ==========
+            // 独立常驻服务，失败不致命（video 侧有 media_proxy.js 回退直连兜底）。
+            // 绑定 127.0.0.1，绝不对外开放。
+            {
+                let cache = media_proxy::MediaCache::new();
+                let port = MEDIA_PROXY_PORT;
+                tauri::async_runtime::spawn(async move {
+                    eprintln!("[desktop-runtime] media_proxy spawn: entered (port={port})");
+                    if let Err(e) = media_proxy::run_media_proxy(port, cache).await {
+                        eprintln!("[desktop-runtime] media_proxy error: {e}");
+                    }
+                });
+            }
 
             Ok(())
         })
