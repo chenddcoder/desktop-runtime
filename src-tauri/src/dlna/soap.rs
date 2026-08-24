@@ -8,6 +8,11 @@ use regex::Regex;
 
 use crate::dlna::av_transport::AvTransport;
 
+/// 强制完成（切集）时 RelTime **超出** TrackDuration 的余量（毫秒）。
+/// 抖音只对"进度超出总时长"（RelTime > TrackDuration）判定播完并切集，
+/// 停在 ==dur 会被视为未超出、不切集（历史实证：上报 position=dur+1000 必切集）。
+const FORCE_COMPLETE_OVERSHOOT_MS: u64 = 1000;
+
 /// 动作处理的结果：携带需要广播给前端的控制意图。
 /// 之前只有 Play 会 emit 事件，Seek/Stop/Pause 被当成 StateChanged 静默吞掉，
 /// 导致手机端进度/退出指令走到 Rust 就断、前端 <video> 永远不知道 → 投屏控制失效。
@@ -206,22 +211,24 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             let dur = av.duration();
             // 强制完成渐进逻辑（TV 下键/手动切集，前端发 force_complete 信号）：
             // 抖音客户端有"先确认在播（上次回报进度>1s）再接受播完信号"的判断，
-            // 直接返回总时长在进度<1s 时会被忽略、不切集。
+            // 直接返回超出值在进度<1s 时会被忽略、不切集。
             //   - 上次回报 <1s（客户端未确认在播）→ 本次先给一个 >1s 过渡值
-            //     （2s，短于 2s 的剧直接给总时长），下次轮询再进入"持续总时长"
-            //   - 上次回报 ≥1s（客户端已确认在播）→ 持续返回总时长
-            // ⚠️ 不能只返回一次总时长就清标志：下一轮 GetPositionInfo 回退到
-            //    真实进度，抖音会判定"设备进度倒退"异常而不切集。必须**持续**
-            //    返回总时长（每轮都 RelTime==TrackDuration），抖音连续确认播完
-            //    才会 SetAVTransportURI 切集；换集时 set_uri 清标志。
-            // 超时兜底：20s 后自动清除（防止客户端一直不切集，进度永久锁死在 100%）。
+            //     （2s，短于 2s 的剧直接给总时长），下次轮询再进入"持续超出"分支
+            //   - 上次回报 ≥1s（客户端已确认在播）→ **持续返回超出总时长的进度**
+            //     （RelTime = dur + FORCE_COMPLETE_OVERSHOOT_MS，即 RelTime>TrackDuration）。
+            //     ⚠️ 必须"超出"而不能停在 ==dur：抖音只对 RelTime>TrackDuration 判定播完
+            //     （历史实证 position=dur+1000 必切集，而 ==dur 会被视为未超出、不切集）。
+            // ⚠️ 不能只返回一次就清标志：下一轮 GetPositionInfo 回退到真实进度，抖音会
+            //    判定"设备进度倒退"异常而不切集。必须**持续**返回（保持标志），
+            //    抖音连续确认超出播完才会 SetAVTransportURI 切集；换集时 set_uri 清标志。
+            // 超时兜底：20s 后自动清除（防止客户端一直不切集，进度永久锁死在末尾）。
             if av.force_complete() && dur > 0 {
                 if av.force_complete_expired(std::time::Duration::from_secs(20)) {
                     av.clear_force_complete();
                 } else {
                     let last = av.last_reported();
                     if last >= 1000 {
-                        pos = dur; // 持续返回总时长（标志保持到换集/超时）
+                        pos = dur + FORCE_COMPLETE_OVERSHOOT_MS; // 持续返回"超出总时长"进度
                     } else {
                         let transition = if dur >= 2000 { 2000 } else { dur };
                         pos = pos.max(transition);
@@ -451,8 +458,10 @@ mod tests {
     }
 
     /// 强制完成渐进逻辑：客户端上次回报 <1s（未确认在播）→ 先返回 2s 过渡值
-    /// 确认在播，保持标志；之后**持续返回总时长**（每轮都 RelTime==TrackDuration，
-    /// 抖音连续确认播完才切集——只返回一次就回退会被判定进度倒退而不切集）。
+    /// 确认在播，保持标志；之后**持续返回超出总时长的进度**（每轮都
+    /// RelTime=TrackDuration+1000 > TrackDuration——抖音对"进度超出总时长"判定
+    /// 播完切集，停在 ==dur 会被视为未超出而不切集；只返回一次就回退则会被判定
+    /// 进度倒退而不切集）。
     #[test]
     fn force_complete_progressive_when_client_below_one_second() {
         let av = crate::dlna::av_transport::AvTransport::new();
@@ -463,19 +472,19 @@ mod tests {
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:02"));
         assert!(av.force_complete(), "过渡后标志应保持");
-        // 第二次及以后：持续返回总时长 29s，标志保持（直到换集/超时）
+        // 第二次及以后：持续返回超出总时长的进度 30s（29s+1s），标志保持（直到换集/超时）
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:29"));
-        assert!(av.force_complete(), "返回总时长后标志应保持（持续确认播完）");
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
+        assert!(av.force_complete(), "返回超出进度后标志应保持（持续确认播完）");
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:29"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
         assert!(av.force_complete());
         // 换集（SetAVTransportURI）清标志
         av.set_uri("http://x/v2.mp4", "");
         assert!(!av.force_complete());
     }
 
-    /// 强制完成：客户端已确认在播（上次回报 ≥1s）→ 直接持续返回总时长。
+    /// 强制完成：客户端已确认在播（上次回报 ≥1s）→ 直接持续返回超出总时长的进度。
     #[test]
     fn force_complete_direct_when_client_playing() {
         let av = crate::dlna::av_transport::AvTransport::new();
@@ -486,11 +495,11 @@ mod tests {
         response_params("GetPositionInfo", &av);
         av.set_force_complete();
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:29"));
-        assert!(av.force_complete(), "返回总时长后标志应保持");
-        // 下一轮仍返回总时长（不回退）
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
+        assert!(av.force_complete(), "返回超出进度后标志应保持");
+        // 下一轮仍返回超出进度（不回退）
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:29"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
     }
 
     /// 换源（切集）清除强制完成信号与上次回报进度。

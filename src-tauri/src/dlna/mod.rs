@@ -343,8 +343,8 @@ pub fn dlna_send_remote_event(
         // TV 下键/手动切集：复用 xiaoyoucast 契约的 next 事件（不新增事件名）。
         // 客户端（抖音）有"先确认在播（进度>1s）再接受播完"的判断逻辑——
         // GetPositionInfo 响应时渐进处理：上次回报 <1s → 先给 >1s 过渡值确认
-        // 在播，之后**持续返回总时长**（不能只返回一次——下一轮回退到真实进度
-        // 会被抖音判定"进度倒退"而不切集），直到客户端 SetAVTransportURI 换集
+        // 在播，之后**持续返回超出总时长的进度**（不能只返回一次——下一轮回退到
+        // 真实进度会被抖音判定"进度倒退"而不切集），直到客户端 SetAVTransportURI 换集
         // （set_uri 清标志）或 20s 超时兜底。
         "next" => {
             av.set_force_complete();
