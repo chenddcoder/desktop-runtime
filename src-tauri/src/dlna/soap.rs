@@ -216,11 +216,13 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             // **<6000ms 一律伪装**。把这类视频"虚拟拉长"到 6s——假装视频大于
             // 5 秒（截断后 6s>5s），让客户端按正常视频建立"播完→切集"机制：
             //   TrackDuration 一律上报 6000ms；RelTime 在 播放中 报真实进度
-            //   （<6s，客户端确认在播、进度条正常走），在 播完 时上报 6000ms
-            //   （==虚拟时长，客户端判定"6s 视频播完"自动切集）。
-            //   - 按下切集（force_complete）：进度直接返回 6s
+            //   （<6s，客户端确认在播、进度条正常走），在 播完 时上报
+            //   **7000ms（虚拟时长 6s + 1s 超出）**——
+            //   ⚠️ 实测 RelTime=6000 == TrackDuration=6000 抖音视为"未超出"不切集，
+            //      必须超出（与长视频 force_complete 的 dur+1000 模式一致）。
+            //   - 按下切集（force_complete）：进度返回 7s
             //   - 没有按下（自然播完）：真实进度到达真实末尾（前端已上报
-            //     pos>=真实时长）→ 进度同样返回 6s
+            //     pos>=真实时长）→ 进度同样返回 7s
             let fake_short = dur > 0 && dur < 6000;
             let reported_dur = if fake_short { 6000 } else { dur };
             if fake_short {
@@ -229,7 +231,8 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
                     av.clear_force_complete();
                 }
                 if av.force_complete() || pos >= dur {
-                    pos = reported_dur; // 按下切集 / 自然播完 → 返回 6s
+                    // 按下切集 / 自然播完 → 返回超出虚拟时长的进度（6s+1s=7s）
+                    pos = reported_dur + FORCE_COMPLETE_OVERSHOOT_MS;
                 }
                 // 其余情况（播放中）：保留真实进度（<6s）
             } else if av.force_complete() && dur > 0 {
@@ -535,63 +538,63 @@ mod tests {
         assert_eq!(av.last_reported(), 0);
     }
 
-    /// 短视频伪装（抖音安卓 <=5s 不自动切集适配）：真实时长 <=5s 时
+    /// 短视频伪装（抖音安卓 <=5s 不自动切集适配）：真实时长 <6s 时
     /// TrackDuration 恒报 6s（假装视频大于 5 秒）；播放中报真实进度；
-    /// 自然播完（前端上报 pos=真实dur+1000）→ 进度同样报 6s（==虚拟时长，
-    /// 客户端按"6s 视频播完"判定并自动切集）。
+    /// 自然播完（前端上报 pos=真实dur+1000）→ 进度报 **7s**（虚拟时长 6s+1s
+    /// 超出——抖音只对 RelTime>TrackDuration 判定播完，==6s 实测不切集）。
     #[test]
     fn short_video_faked_to_six_seconds_on_natural_end() {
         let av = crate::dlna::av_transport::AvTransport::new();
         av.set_uri("http://x/short.mp4", "");
-        av.update_duration(3_000); // 真实 3s（<=5s）
+        av.update_duration(3_000); // 真实 3s（<6s）
         // 播放中：报真实进度，TrackDuration 报 6s
         av.update_position(2_000);
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:02"));
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:06"));
-        // 自然播完：前端上报 pos=真实dur+1000（4s）→ 伪装成 6s（==虚拟时长）
+        // 自然播完：前端上报 pos=真实dur+1000（4s）→ 伪装成 7s（6s+1s 超出，触发切集）
         av.update_position(4_000);
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:06"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:07"));
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:06"));
     }
 
-    /// 短视频伪装：按下切集（force_complete）→ 进度直接返回 6s（==虚拟时长）。
+    /// 短视频伪装：按下切集（force_complete）→ 进度返回 7s（虚拟时长 6s+1s 超出）。
     #[test]
     fn short_video_faked_to_six_seconds_on_force_complete() {
         let av = crate::dlna::av_transport::AvTransport::new();
         av.set_uri("http://x/short.mp4", "");
-        av.update_duration(4_000); // 真实 4s（<=5s）
+        av.update_duration(4_000); // 真实 4s（<6s）
         av.update_position(1_000);
         av.set_force_complete();
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:06"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:07"));
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:06"));
-        assert!(av.force_complete(), "换集前标志应保持（持续返回 6s）");
+        assert!(av.force_complete(), "换集前标志应保持（持续返回 7s）");
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:06"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:07"));
     }
 
     /// 短视频伪装边界：抖音按整数秒截断判定（5163ms 也被当 5s），
-    /// 故真实时长 <6000ms 一律伪装成 6s；恰好 6000ms（截断 6s>5s）不伪装；
-    /// 时长未知（流式）不伪装。
+    /// 故真实时长 <6000ms 一律伪装成 6s 时长、播完/切集进度 7s；
+    /// 恰好 6000ms（截断 6s>5s）不伪装；时长未知（流式）不伪装。
     #[test]
     fn short_video_fake_boundary() {
         let av = crate::dlna::av_transport::AvTransport::new();
         av.set_uri("http://x/b.mp4", "");
-        // 恰好 5s → 伪装 6s（播完进度也 6s）
+        // 恰好 5s → 伪装 6s 时长、播完进度 7s
         av.update_duration(5_000);
         av.update_position(5_000);
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:06"));
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:06"));
-        // 5.163s（真实日志场景，抖音整数秒截断当 5s）→ 也要伪装 6s
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:07"));
+        // 5.163s（真实日志场景，抖音整数秒截断当 5s）→ 也要伪装（时长 6s、进度 7s）
         av.set_uri("http://x/b2.mp4", "");
         av.update_duration(5_163);
         av.update_position(6_163); // 播完/切集上报的超实时长进度
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:06"));
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:06"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:07"));
         // 恰好 6s（截断 6s>5s）→ 不伪装，按真实时长返回
         av.set_uri("http://x/c.mp4", "");
         av.update_duration(6_000);
