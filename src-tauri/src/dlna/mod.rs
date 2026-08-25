@@ -220,72 +220,86 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
     // 把状态机存进全局，前端据此上报真实播放进度（GetPositionInfo 才能返回非零 RelTime）。
     *inner.av.lock().unwrap() = Some(av.clone());
 
-    // —— 抖音播放列表 TCP 通道（必须先于 SSDP/HTTP 启动：BDLEPORT 头必须指向真实监听端口）——
+    // —— 抖音播放列表 TCP 通道（**列表功能总开关控制**，2026-08-25 陈兄要求）——
     // 手机（抖音）发现本设备后连上 control_port：GetDeviceInfo 握手 → Play/AddDramaList
     // 下发剧集列表 → 本地按 dramaId 合并维护。列表当前项变化时回调 emit dlna://play，
     // 前端（esapp-tvcast casting 页）收到新 url 换源播放；播完自动切集见 auto_next。
-    eprintln!("[dlna_start] starting playlist channel...");
+    // ⚠️ 抖音极速版对 PushMediaInfo 存在 `must not be null` 闪退风险（崩溃堆栈已实锤，
+    // 未根治前**默认关闭**）。开启：环境变量 DOUYIN_PLAYLIST=1，或 dlna-config.json
+    // 写 {"playlistEnabled": true}（与 dlna-device-id.json 同目录）。关闭时：
+    // ① 不监听 45165；② control_port=None → SSDP/HTTP 发现层回标准指纹、无扩展头，
+    //    抖音投屏退回普通 DLNA 单集链路（短视频 5s 伪装等非列表行为不受影响）。
+    let playlist_enabled = playlist::playlist_enabled();
+    eprintln!("[dlna_start] playlist feature enabled={playlist_enabled}");
     let service_id = format!("{}-{}", uuid_simple(), random_digits(4));
     let device_id = playlist::device_id();
-    let playlist_device = playlist::PlaylistDeviceIdentity {
-        ip: local_ip.clone(),
-        name: name.clone(),
-        package_name: "cn.chenddcoder.tvcast".to_string(),
-        device_id: device_id.clone(),
-        os_version: std::env::consts::OS.to_string(),
-        device_model: std::env::consts::ARCH.to_string(),
-        device_brand: "desktop".to_string(),
-    };
-    let app_pl = app.clone();
-    let pl_channel = match playlist::PlaylistChannel::start(
-        playlist_device,
-        inner.shutdown_tx.subscribe(),
-        Box::new(move |item| {
-            // 列表当前项变化（手机 Play/AddDramaList/选集命令）→ 通知前端换源播放
-            eprintln!(
-                "[dlna_playlist] play request → url={} title={}",
-                item.url,
-                item.title
-            );
-            // addOn 激活判据：**按投屏 URL 判断是否抖音源**（9 域名 + ott_cast）。
-            // 非抖音 URL 即使走了列表通道也不激活列表行为（playlist_mode=false、
-            // 不 set_uri/play）——公版投屏链路零污染。抖音 URL 才置列表模式：
-            // GetPositionInfo 转为如实报告（禁用 fake_short / force_complete 伪装），
-            // 否则客户端自己也判"播完"发起第二路切集竞态。
-            if let Some(av) = state().av.lock().unwrap().as_ref() {
-                let douyin = crate::dlna::playlist::is_douyin_url(&item.url);
-                av.set_playlist_mode(douyin);
-                if douyin {
-                    // 关键修复（2026-08-25 实测）：列表通道模式下抖音（极速版）靠
-                    // Play/AddDramaList/选集命令起播/换集，**不发送 SetAVTransportURI**
-                    //（日志全程无 SetAVTransportURI）。若此处不 set_uri，GetPositionInfo
-                    // 的 TrackURI 恒为空（实测 TrackURI="" + force_complete=true 残留），
-                    // 抖音端轮询判定设备异常，按下切集时 TrackURI 突变直接退出投屏
-                    //（实测 client disconnected）。set_uri 让 TrackURI/TrackMetaData 始终
-                    // 跟随当前列表项，同时清 force_complete/pos/dur（起播后前端重新上报）。
-                    av.set_uri(&item.url, "");
-                    av.play();
+    let control_port: Option<u16> = if playlist_enabled {
+        let playlist_device = playlist::PlaylistDeviceIdentity {
+            ip: local_ip.clone(),
+            name: name.clone(),
+            package_name: "cn.chenddcoder.tvcast".to_string(),
+            device_id: device_id.clone(),
+            os_version: std::env::consts::OS.to_string(),
+            device_model: std::env::consts::ARCH.to_string(),
+            device_brand: "desktop".to_string(),
+        };
+        let app_pl = app.clone();
+        let pl_channel = match playlist::PlaylistChannel::start(
+            playlist_device,
+            inner.shutdown_tx.subscribe(),
+            Box::new(move |item| {
+                // 列表当前项变化（手机 Play/AddDramaList/选集命令）→ 通知前端换源播放
+                eprintln!(
+                    "[dlna_playlist] play request → url={} title={}",
+                    item.url,
+                    item.title
+                );
+                // addOn 激活判据：**按投屏 URL 判断是否抖音源**（9 域名 + ott_cast）。
+                // 非抖音 URL 即使走了列表通道也不激活列表行为（playlist_mode=false、
+                // 不 set_uri/play）——公版投屏链路零污染。抖音 URL 才置列表模式：
+                // GetPositionInfo 转为如实报告（禁用 fake_short / force_complete 伪装），
+                // 否则客户端自己也判"播完"发起第二路切集竞态。
+                if let Some(av) = state().av.lock().unwrap().as_ref() {
+                    let douyin = crate::dlna::playlist::is_douyin_url(&item.url);
+                    av.set_playlist_mode(douyin);
+                    if douyin {
+                        // 关键修复（2026-08-25 实测）：列表通道模式下抖音（极速版）靠
+                        // Play/AddDramaList/选集命令起播/换集，**不发送 SetAVTransportURI**
+                        //（日志全程无 SetAVTransportURI）。若此处不 set_uri，GetPositionInfo
+                        // 的 TrackURI 恒为空（实测 TrackURI="" + force_complete=true 残留），
+                        // 抖音端轮询判定设备异常，按下切集时 TrackURI 突变直接退出投屏
+                        //（实测 client disconnected）。set_uri 让 TrackURI/TrackMetaData 始终
+                        // 跟随当前列表项，同时清 force_complete/pos/dur（起播后前端重新上报）。
+                        av.set_uri(&item.url, "");
+                        av.play();
+                    }
                 }
+                let _ = app_pl.emit(
+                    "dlna://play",
+                    serde_json::json!({ "url": item.url, "title": item.title }),
+                );
+            }),
+        )
+        .await
+        {
+            Ok(ch) => ch,
+            Err(e) => {
+                eprintln!("[dlna_start] playlist channel failed: {e}");
+                return Err(format!(
+                    "【步骤2/4 播放列表通道】失败: {e} · 45165/临时端口无法绑定"
+                ));
             }
-            let _ = app_pl.emit(
-                "dlna://play",
-                serde_json::json!({ "url": item.url, "title": item.title }),
-            );
-        }),
-    )
-    .await
-    {
-        Ok(ch) => ch,
-        Err(e) => {
-            eprintln!("[dlna_start] playlist channel failed: {e}");
-            return Err(format!(
-                "【步骤2/4 播放列表通道】失败: {e} · 45165/临时端口无法绑定"
-            ));
-        }
+        };
+        let cp = pl_channel.control_port();
+        *inner.playlist.lock().unwrap() = Some(pl_channel.clone());
+        eprintln!("[dlna_start] playlist channel port={cp}");
+        Some(cp)
+    } else {
+        eprintln!(
+            "[dlna_start] playlist feature DISABLED: BDLE channel skipped (开启: DOUYIN_PLAYLIST=1 或 dlna-config.json playlistEnabled=true)"
+        );
+        None
     };
-    let control_port = pl_channel.control_port();
-    *inner.playlist.lock().unwrap() = Some(pl_channel.clone());
-    eprintln!("[dlna_start] playlist channel port={control_port}");
 
     // —— HTTP server（服务设备描述 + 接收 SOAP 控制）——
     let preferred = port.unwrap_or(5001);
@@ -324,7 +338,7 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
             http_port,
             desc_http,
             av_http,
-            Some(control_http),
+            control_http,
             &device_id_http,
             &service_id_http,
             &mut shutdown_http,
@@ -359,8 +373,9 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
     let control_ssdp = control_port;
     let device_id_ssdp = device_id.clone();
     let service_id_ssdp = service_id.clone();
-    // WiFi 切换时 SSDP 重绑定成功 → 回调同步 playlist 通道设备 IP（GetDeviceInfo/PushMediaInfo 上报新 IP）
-    let pl_ssdp = pl_channel.clone();
+    // WiFi 切换时 SSDP 重绑定成功 → 回调同步 playlist 通道设备 IP（GetDeviceInfo/PushMediaInfo 上报新 IP）；
+    // 列表功能关闭时 inner.playlist 为 None，回调跳过（无通道可同步）。
+    let pl_ssdp = inner.playlist.lock().unwrap().clone();
     tokio::spawn(async move {
         ssdp::run_ssdp(
             app_ssdp,
@@ -368,12 +383,14 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
             &uuid_ssdp,
             local_ip_ssdp,
             http_port,
-            Some(control_ssdp),
+            control_ssdp,
             &device_id_ssdp,
             &service_id_ssdp,
             Box::new(move |new_ip: &str| {
                 eprintln!("[dlna_start] SSDP rebound, sync playlist device ip={new_ip}");
-                pl_ssdp.set_ip(new_ip.to_string());
+                if let Some(pl) = &pl_ssdp {
+                    pl.set_ip(new_ip.to_string());
+                }
             }),
             &mut shutdown_ssdp,
         )
@@ -462,7 +479,7 @@ pub async fn dlna_send_remote_event(
         // 00:00:00 → 客户端（Android 抖音）判定"未播放"、进度条不更新。
         data.get(key).and_then(|v| v.as_u64())
     };
-    // 列表模式播完/手动切集 → 本地切下一集并通知前端换源（见下方 auto_next）
+    // 列表模式进度同步（GetStatusInfo 内部字段维护；切集见 "next" 分支注释）
     let playlist_ref = inner.playlist.lock().unwrap().as_ref().cloned();
     match event_name.as_str() {
         "play" => av.update_playback(true, false),
@@ -476,17 +493,17 @@ pub async fn dlna_send_remote_event(
         "position" => {
             if let Some(ms) = num_field("position") {
                 av.update_position(ms);
-                // 同步进度到播放列表状态：抖音端轮询 TCP GetStatusInfo 校验双通道
-                // 一致性（duration/position 写死 0 会让客户端判定设备状态异常退出）。
+                // 同步进度到播放列表状态（供内部维护；GetStatusInfo 仍回 demo 形态 0/0）
                 if let Some(pl) = &playlist_ref {
                     pl.update_progress(av.duration(), ms);
                     let dur = av.duration();
-                    // 播完自动切集（仅列表模式：手机已通过 TCP 通道下发完整剧集列表）：
-                    // 前端播完兜底会连续上报 pos>=dur（progress timer 锁定 dur+1000），
-                    // 这里检测到"当前集播完"就本地 move(1) → emit dlna://play(下一集)，
-                    // 不再依赖客户端（手机）轮询 GetPositionInfo 判定播完再换集。
+                    // 播完自动切集（列表模式）：前端播完兜底连报 pos>=dur → 本地
+                    // move(1) → emit dlna://play(下一集) + push。⚠️ 抖音极速版
+                    // **列表模式不响应 SOAP 播完信号**（实测），只能服务端切；
+                    // push 安全性由 normalize_bean 保证（防抖音端 checkNotNull 崩溃，
+                    // 2026-08-25 堆栈实锤——demo 原样回传同样闪退）。
                     if pl.has_playlist() && dur > 0 && ms >= dur {
-                        auto_next(&app, &av, pl).await;
+                        auto_next(&app, &av, pl, false).await;
                     }
                 }
             }
@@ -501,11 +518,15 @@ pub async fn dlna_send_remote_event(
         }
         "next" => {
             // TV 下键/手动切集：
-            //  - 列表模式 → 本地直接切下一集（不依赖客户端），前端换源播放
+            //  - 列表模式 → 服务端本地切下一集（auto_next：move + set_uri + emit +
+            //    push）。⚠️ 抖音极速版**列表模式不响应 SOAP 播完信号**（实测按
+            //    force_complete 后它不动作，只会干等），切集只能服务端发起；push
+            //    安全性由 normalize_bean 保证（dramaBeans 必填字段补齐，防抖音端
+            //    checkNotNull 崩溃——2026-08-25 堆栈实锤，demo 原样回传同样闪退）。
             //  - 非列表模式 → force_complete 伪装播完，客户端（抖音）轮询后 SetAVTransportURI 换集
             if let Some(pl) = &playlist_ref {
                 if pl.has_playlist() {
-                    if !auto_next(&app, &av, pl).await {
+                    if !auto_next(&app, &av, pl, true).await {
                         // 已是最后一集：无下一项，退化为 force_complete（客户端自行处理）
                         av.set_force_complete();
                     }
@@ -528,14 +549,26 @@ pub async fn dlna_send_remote_event(
     Ok(())
 }
 
-/// 列表模式自动切集：playlist.move(1) 拿到下一项 → 更新 AvTransport（清进度/换 uri/置 Playing）
-/// → emit dlna://play 通知前端换源播放 → PushMediaInfo 同步手机端列表 UI。
+/// 列表模式切集：playlist.move(1) 拿到下一项 → 更新 AvTransport（换 uri/置 Playing）
+/// → emit dlna://play 通知前端换源 → PushMediaInfo 同步手机端列表 UI。
+/// ⚠️ 抖音极速版**列表模式不响应 SOAP 播完信号**（force_complete 按下后它不动作），
+/// 切集只能服务端发起；PushMediaInfo 的安全性由 normalize_bean 保证（dramaBeans
+/// 必填字段补齐，防抖音端 excuteBdleMessage checkNotNull 崩溃——2026-08-25 堆栈
+/// 实锤，demo 原样回传同样闪退）。
+/// `force=true`：手动切集（TV 遥控 next），跳过 1s 防抖；`false`：播完自动切，
+/// 保留防抖去重（前端 position 连报 dur+1000 只切一次）。
 /// 返回是否成功切到下一项（末尾无下一项返回 false）。
-async fn auto_next(app: &AppHandle, av: &Arc<AvTransport>, pl: &Arc<playlist::PlaylistChannel>) -> bool {
-    match pl.next_and_get() {
+async fn auto_next(
+    app: &AppHandle,
+    av: &Arc<AvTransport>,
+    pl: &Arc<playlist::PlaylistChannel>,
+    force: bool,
+) -> bool {
+    // notify=false：只切集不触发 on_play_request 回调——addOn URL 守卫必须在
+    // set_uri/emit **之前**执行（回调会先 emit，守卫就形同虚设），且避免双 emit。
+    match pl.next_and_get(false, force) {
         Some(item) => {
-            // addOn 守卫：仅抖音源 URL 才本地切集（列表混入非抖音 URL 时拒绝，
-            // 防止公版内容被"播完即切"逻辑污染）。
+            // addOn 守卫：仅抖音源 URL 才本地切集（列表混入非抖音 URL 时拒绝）
             if !crate::dlna::playlist::is_douyin_url(&item.url) {
                 return false;
             }
@@ -548,7 +581,7 @@ async fn auto_next(app: &AppHandle, av: &Arc<AvTransport>, pl: &Arc<playlist::Pl
                 "dlna://play",
                 serde_json::json!({ "url": item.url, "title": item.title }),
             );
-            // 手机端列表/进度 UI 跟随
+            // 手机端列表/进度 UI 跟随（normalize_bean 已保证条目结构完整，不触发崩溃）
             pl.push_media_info().await;
             true
         }

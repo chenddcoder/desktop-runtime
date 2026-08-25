@@ -280,24 +280,47 @@ fn build_notify_messages(
     for st in service_types {
         entries.push((st.into(), format!("uuid:{uuid}::{st}")));
     }
-    // ⚠️ NOTIFY 必须带抖音 SERVER 指纹 + 全套扩展头（对齐 demo sendNotify）：
-    // 抖音/乐播若走被动监听 ssdp:alive 发现设备，NOTIFY 没有能力头就不会连
-    // BDLEPORT 列表通道（降级为普通 DLNA）。普通 DLNA 客户端忽略未知头，不受影响。
-    let ext = crate::dlna::playlist::discovery_headers(control_port, device_id, service_id);
-    let ext_str: String = ext.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
+    // ⚠️ 列表功能开启（control_port=Some）时 NOTIFY 带抖音 SERVER 指纹 + 全套扩展头
+    //（对齐 demo sendNotify）：抖音/乐播若走被动监听 ssdp:alive 发现设备，NOTIFY 没有
+    // 能力头就不会连 BDLEPORT 列表通道（降级为普通 DLNA）。普通 DLNA 客户端忽略未知头。
+    // 列表功能关闭（默认，见 playlist::playlist_enabled）→ 标准指纹 + 无扩展头 +
+    // max-age=1800，纯公版 DLNA 行为。
+    let douyin = control_port.is_some();
+    let (ext_str, cache_control, server) = if douyin {
+        let ext = crate::dlna::playlist::discovery_headers(control_port, device_id, service_id);
+        (
+            ext.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect::<String>(),
+            "max-age=66",
+            crate::dlna::playlist::wire::DOUYIN_SERVER,
+        )
+    } else {
+        (
+            String::new(),
+            "max-age=1800",
+            crate::dlna::playlist::wire::STD_SERVER,
+        )
+    };
     entries
         .into_iter()
-        .map(|(nt, usn)| build_notify(&nt, &usn, location, &ext_str))
+        .map(|(nt, usn)| build_notify(&nt, &usn, location, &ext_str, cache_control, server))
         .collect()
 }
 
-fn build_notify(nt: &str, usn: &str, location: &str, ext_headers: &str) -> String {
+fn build_notify(
+    nt: &str,
+    usn: &str,
+    location: &str,
+    ext_headers: &str,
+    cache_control: &str,
+    server: &str,
+) -> String {
     format!(
-        "NOTIFY * HTTP/1.1\r\nHOST: {addr}:{port}\r\nCACHE-CONTROL: max-age=66\r\n{ext}LOCATION: {loc}\r\nSERVER: {server}\r\nNT: {nt}\r\nNTS: ssdp:alive\r\nUSN: {usn}\r\nContent-Length: 0\r\n\r\n",
+        "NOTIFY * HTTP/1.1\r\nHOST: {addr}:{port}\r\nCACHE-CONTROL: {cache}\r\n{ext}LOCATION: {loc}\r\nSERVER: {server}\r\nNT: {nt}\r\nNTS: ssdp:alive\r\nUSN: {usn}\r\nContent-Length: 0\r\n\r\n",
         addr = SSDP_MULTICAST_ADDR,
         port = SSDP_PORT,
+        cache = cache_control,
         loc = location,
-        server = crate::dlna::playlist::wire::DOUYIN_SERVER,
+        server = server,
         nt = nt,
         usn = usn,
         ext = ext_headers
@@ -366,10 +389,12 @@ fn should_respond(st: &str, _uuid: &str) -> bool {
 ///  - ssdp:all / rootdevice → uuid:{uuid}::upnp:rootdevice
 ///  - uuid:{uuid}          → uuid:{uuid}
 ///  - 其它（含 DIAL/未知）  → uuid:{uuid}::{st}（回显）
-/// ⚠️ M-SEARCH 响应带**抖音兼容指纹 SERVER** + 播放列表扩展头（BITMAP/BDLEPORT/UID/
-/// SERVICEID/X-User-Agent）：这是抖音手机端打开列表 TCP 通道的必要条件（dlna_demo
-/// 已 A/B 实测——普通 SERVER 时抖音只走 SetAVTransportURI/Play，从不连列表端口）。
-/// NOTIFY alive 同样带全套头（demo sendNotify 同款）——被动监听发现的路径也不能少。
+/// ⚠️ M-SEARCH 响应：列表功能开启（control_port=Some）时带**抖音兼容指纹 SERVER** +
+/// 播放列表扩展头（BITMAP/BDLEPORT/UID/SERVICEID/X-User-Agent）——这是抖音手机端
+/// 打开列表 TCP 通道的必要条件（dlna_demo 已 A/B 实测——普通 SERVER 时抖音只走
+/// SetAVTransportURI/Play，从不连列表端口）。NOTIFY alive 同样带全套头（demo
+/// sendNotify 同款）——被动监听发现的路径也不能少。
+/// 列表功能关闭（默认）→ 标准指纹 + 无扩展头 + max-age=1800，纯公版行为。
 fn build_msearch_response(
     st: &str,
     uuid: &str,
@@ -385,16 +410,27 @@ fn build_msearch_response(
     } else {
         format!("uuid:{uuid}::{st}")
     };
-    let ext = crate::dlna::playlist::discovery_headers(control_port, device_id, service_id);
-    let ext_str: String = ext
-        .iter()
-        .map(|(k, v)| format!("{k}: {v}\r\n"))
-        .collect();
+    let douyin = control_port.is_some();
+    let (ext_str, cache_control, server) = if douyin {
+        let ext = crate::dlna::playlist::discovery_headers(control_port, device_id, service_id);
+        (
+            ext.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect::<String>(),
+            "max-age=66",
+            crate::dlna::playlist::wire::DOUYIN_SERVER,
+        )
+    } else {
+        (
+            String::new(),
+            "max-age=1800",
+            crate::dlna::playlist::wire::STD_SERVER,
+        )
+    };
     format!(
-        "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=66\r\nDATE: {date}\r\nEXT:\r\nLOCATION: {loc}\r\nSERVER: {server}\r\nST: {st}\r\nUSN: {usn}\r\n{ext}Content-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nCACHE-CONTROL: {cache}\r\nDATE: {date}\r\nEXT:\r\nLOCATION: {loc}\r\nSERVER: {server}\r\nST: {st}\r\nUSN: {usn}\r\n{ext}Content-Length: 0\r\n\r\n",
+        cache = cache_control,
         date = http_date(),
         loc = location,
-        server = crate::dlna::playlist::wire::DOUYIN_SERVER,
+        server = server,
         st = st,
         usn = usn,
         ext = ext_str
@@ -462,6 +498,27 @@ mod tests {
         assert_eq!(responses.len(), 1);
         assert!(responses[0].contains("ST: urn:schemas-upnp-org:device:MediaRenderer:1"));
         assert!(responses[0].contains("USN: uuid:test-uuid::urn:schemas-upnp-org:device:MediaRenderer:1"));
+    }
+
+    // 列表功能关闭（control_port=None）→ NOTIFY/M-SEARCH 回标准指纹 + 无扩展头 +
+    // max-age=1800（纯公版 DLNA 行为；开启时才带抖音指纹与 BDLEPORT 能力头）。
+    #[test]
+    fn discovery_falls_back_to_std_when_playlist_disabled() {
+        let msgs = build_notify_messages("test-uuid", "http://192.168.1.2:5001/device-desc.xml", None, "12345", "svc-1");
+        assert!(!msgs.is_empty());
+        for m in &msgs {
+            assert!(m.contains(&format!("SERVER: {}", crate::dlna::playlist::wire::STD_SERVER)), "NOTIFY should use std SERVER when playlist disabled: {m}");
+            assert!(m.contains("CACHE-CONTROL: max-age=1800"), "NOTIFY should use max-age=1800 when playlist disabled: {m}");
+            assert!(!m.contains("BDLEPORT"), "NOTIFY must not carry BDLEPORT when playlist disabled: {m}");
+            assert!(!m.contains("BITMAP"), "NOTIFY must not carry BITMAP when playlist disabled: {m}");
+            assert!(!m.contains("X-User-Agent"), "NOTIFY must not carry X-User-Agent when playlist disabled: {m}");
+        }
+        let data = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: upnp:rootdevice\r\n\r\n";
+        let responses = handle_msearch(data, "test-uuid", "192.168.1.2", 5001, None, "12345", "svc-1").unwrap();
+        for r in &responses {
+            assert!(r.contains(&format!("SERVER: {}", crate::dlna::playlist::wire::STD_SERVER)), "M-SEARCH should use std SERVER when playlist disabled: {r}");
+            assert!(!r.contains("BDLEPORT"), "M-SEARCH must not carry BDLEPORT when playlist disabled: {r}");
+        }
     }
 
     // 验证 socket2 路径走得通（高位端口避开沙箱 / CI 的 1900 占用）。

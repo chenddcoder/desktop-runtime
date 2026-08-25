@@ -84,6 +84,8 @@ pub struct PlaylistItem {
 
 /// 稳定的数字字符串 deviceId：存 JSON 文件，同一安装不改变（对齐 demo UID 要求）。
 const DEVICE_ID_FILE: &str = "dlna-device-id.json";
+/// 列表功能配置文件（与 dlna-device-id.json 同目录）：{"playlistEnabled": true}
+const CONFIG_FILE: &str = "dlna-config.json";
 
 /// 构造 SSDP / description.xml 响应需要附加的扩展头
 /// （BITMAP / BDLEPORT / UID / SERVICEID / X-User-Agent，对齐 demo 增强发现头）。
@@ -105,20 +107,52 @@ pub fn discovery_headers(control_port: Option<u16>, device_id: &str, service_id:
     v
 }
 
-fn config_path() -> Option<std::path::PathBuf> {
+/// 配置文件路径：优先 cwd（dev 调试），文件不存在则回退可执行文件目录（发布形态）。
+/// 语义与原 device_id 持久化一致：cwd 已有目标文件 → 用 cwd；否则用 exe 目录（含创建）。
+fn config_file(name: &str) -> Option<std::path::PathBuf> {
     if let Ok(d) = std::env::current_dir() {
-        let p = d.join(DEVICE_ID_FILE);
+        let p = d.join(name);
         if p.exists() {
             return Some(p);
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            let p = parent.join(DEVICE_ID_FILE);
-            return Some(p);
+            return Some(parent.join(name));
         }
     }
     None
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    config_file(DEVICE_ID_FILE)
+}
+
+/// 抖音播放列表功能总开关（2026-08-25 陈兄要求）：控制 BDLE TCP 列表通道 +
+/// SSDP/HTTP 发现层抖音指纹/扩展头是否启用。**默认关闭**——抖音极速版对
+/// PushMediaInfo 存在 `IllegalStateException: must not be null` 闪退风险
+/// （崩溃堆栈已实锤，未根治前先提供开关规避；关闭后抖音投屏退回普通 DLNA
+/// 单集链路，短视频 5s 伪装等非列表行为不受影响）。
+/// 开启方式（任一优先）：
+///  1) 环境变量 DOUYIN_PLAYLIST=1|true|yes|on（临时调试最方便）
+///  2) 配置文件 dlna-config.json（与 dlna-device-id.json 同目录）: {"playlistEnabled": true}
+pub fn playlist_enabled() -> bool {
+    if let Ok(v) = std::env::var("DOUYIN_PLAYLIST") {
+        let v = v.trim().to_ascii_lowercase();
+        if !v.is_empty() {
+            return v == "1" || v == "true" || v == "yes" || v == "on";
+        }
+    }
+    if let Some(p) = config_file(CONFIG_FILE) {
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                if let Some(b) = v.get("playlistEnabled").and_then(|x| x.as_bool()) {
+                    return b;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// 判断投屏 URL 是否为抖音系源——**addOn 激活判据**：只有抖音源 URL 才启用
@@ -268,6 +302,43 @@ fn first_num(obj: &Value, keys: &[&str]) -> Option<f64> {
     None
 }
 
+/// PushMediaInfo 回传前规范化 dramaBeans 条目：抖音端（aweme.lite）处理
+/// PushMediaInfo 时对条目做必填字段检查（顶层 dramaId / urlBeans），缺失即
+/// `IllegalStateException: must not be null` 崩溃（demo 原样回传同样闪退，
+/// 2026-08-25 用户抓堆栈实锤）。确保顶层必填字段存在（用 PlaylistItem 提取值
+/// 兜底），同时保留原始全部字段不破坏其它结构。
+fn normalize_bean(i: &PlaylistItem) -> Value {
+    let mut bean = i.raw.clone();
+    // 顶层 dramaId：缺失/空串 → 用提取值覆盖
+    let top_did = bean
+        .get("dramaId")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    if !top_did {
+        bean["dramaId"] = json!(i.drama_id);
+    }
+    // 顶层 urlBeans：缺失/空数组 → 用提取 URL 构造标准条目（raw 顶层 url 优先，
+    // PlaylistItem.url 兜底——extract_item 只查 urlBeans/urls，顶层 url 提取不到）
+    let has_ub = bean
+        .get("urlBeans")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
+    if !has_ub {
+        let fallback_url = bean
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| (!i.url.is_empty()).then(|| i.url.clone()));
+        if let Some(u) = fallback_url {
+            bean["urlBeans"] = json!([{ "url": u, "isDefault": true }]);
+        }
+    }
+    bean
+}
+
 /// 从 episode JSON 提取 PlaylistItem；url 选 isDefault 优先，没有则取第一条。
 fn extract_item(v: &Value, fallback_index: usize) -> PlaylistItem {
     let drama_id = first_str(v, &["dramaId"]).unwrap_or_else(|| format!("item-{}", fallback_index));
@@ -328,6 +399,11 @@ pub struct PlaylistState {
     /// 判定设备状态异常而退出投屏，对齐 demo mediaState.duration/position）。
     pub duration: u64,
     pub position: u64,
+    /// 上次 position 上报/重置时刻：status_info() 在 PLAYING 状态下按流逝时间
+    /// 推进 position（1x 速度、封顶 duration），保证抖音端轮询永远看到"进度在走"
+    /// ——前端上报链路可能断续/卡顿（实测 position 卡死在 559 被判定异常），
+    /// 服务端推进作为兜底；前端每次 update_progress/切集重置基准。
+    last_position_update: Option<std::time::Instant>,
 }
 
 impl PlaylistState {
@@ -341,6 +417,7 @@ impl PlaylistState {
             volume: 50,
             duration: 0,
             position: 0,
+            last_position_update: None,
         }
     }
 
@@ -353,6 +430,21 @@ impl PlaylistState {
         self.volume = 50;
         self.duration = 0;
         self.position = 0;
+        self.last_position_update = None;
+    }
+
+    /// 当前列表项自带时长（毫秒，来自 dramaBeans 条目 durationMs/duration）。
+    /// 切集/选集/起播后 GetStatusInfo **立即**返回它而不是 0：抖音端收到
+    /// PushMediaInfo（播单当前集已切到新集）后会立刻轮询 GetStatusInfo 做
+    /// "状态时长 vs 播单当前集时长"一致性校验，若返回 0 而播单新集时长非 0
+    /// （前端起播新集、上报实时值之前有个窗口期），校验失败直接退出投屏
+    /// （实测 client disconnected）。对齐 demo：播放器换源后 mediaState.duration
+    /// 即时恢复实时值，不存在 0 窗口。
+    fn current_duration(&self) -> u64 {
+        self.items
+            .get(&self.current_episode_id)
+            .map(|i| i.duration_ms)
+            .unwrap_or(0)
     }
 
     /// 前端进度上报同步（等价 demo 播放器回调更新 mediaState.duration/position）
@@ -361,6 +453,8 @@ impl PlaylistState {
             self.duration = duration;
         }
         self.position = position;
+        // 前端实时上报 → 重置推进基准（status_info 从此刻起按流逝时间推进）
+        self.last_position_update = Some(std::time::Instant::now());
     }
 
     fn has_items(&self) -> bool {
@@ -380,7 +474,14 @@ impl PlaylistState {
     }
 
     /// Play / AddDramaList 合并：已存在更新、不存在按到达顺序追加；单项 Play 不清列表。
-    fn apply_play(&mut self, body: &Value) {
+    /// apply_play(body, append)：
+    ///  - `append=false`（Play 命令/首次起播）：current 切到 startDramaId/dramaId
+    ///    （demo 语义——Play 是新播单，当前集由手机端指定）。
+    ///  - `append=true`（AddDramaList 命令/预加载追加）：**不覆盖 current**——
+    ///    current 由"当前在播集"决定（Play 或宿主 TV 切集已设定）。demo 覆盖
+    ///    是因为其场景 startDramaId 恒等于 current（纯命令驱动、无外部切集）；
+    ///    本场景若覆盖会把 TV 已切的新集打回旧集，前端被 emit 换源回退（实测乱）。
+    fn apply_play(&mut self, body: &Value, append: bool) {
         let prev = self.current_episode_id.clone();
         for key in ["dramaBeans", "playlist"] {
             if let Some(beans) = deep_find(body, key).and_then(|v| v.as_array()) {
@@ -395,12 +496,16 @@ impl PlaylistState {
                 break;
             }
         }
-        // 当前项：startDramaId > dramaId（**只在顶层找**——deep_find 会递归进
-        // dramaBeans 内部把列表第一项的 dramaId 误当"当前项"，AddDramaList 预加载
-        // 时会把正在播的集切成列表头。协议字段位置在 body 顶层，顶层查找足够）。
-        let requested = first_top_level_str(body, &["startDramaId", "dramaId"]);
-        if !requested.is_empty() && self.items.contains_key(&requested) {
-            self.current_episode_id = requested;
+        if !append {
+            // 当前项：startDramaId > dramaId（**只在顶层找**——deep_find 会递归进
+            // dramaBeans 内部把列表第一项的 dramaId 误当"当前项"。协议字段位置在
+            // body 顶层，顶层查找足够）。
+            let requested = first_top_level_str(body, &["startDramaId", "dramaId"]);
+            if !requested.is_empty() && self.items.contains_key(&requested) {
+                self.current_episode_id = requested;
+            } else if self.current_episode_id.is_empty() && !self.order.is_empty() {
+                self.current_episode_id = self.order[0].clone();
+            }
         } else if self.current_episode_id.is_empty() && !self.order.is_empty() {
             self.current_episode_id = self.order[0].clone();
         }
@@ -408,10 +513,11 @@ impl PlaylistState {
             self.speed = speed;
         }
         self.status = "PLAYING".to_string();
-        // 当前集变化（起播/换集）→ 进度归零
+        // 当前集变化（起播/换集）→ position 归零，duration 预填列表项自带值
         if prev != self.current_episode_id {
             self.position = 0;
-            self.duration = 0;
+            self.duration = self.current_duration();
+            self.last_position_update = Some(std::time::Instant::now());
         }
     }
 
@@ -455,9 +561,10 @@ impl PlaylistState {
         if !id.is_empty() && self.items.contains_key(id) {
             self.current_episode_id = id.to_string();
             self.status = "PLAYING".to_string();
-            // 选集 → 进度归零
+            // 选集 → position 归零，duration 预填列表项自带值
             self.position = 0;
-            self.duration = 0;
+            self.duration = self.current_duration();
+            self.last_position_update = Some(std::time::Instant::now());
             true
         } else {
             false
@@ -481,9 +588,11 @@ impl PlaylistState {
         let id = self.order[target as usize].clone();
         self.current_episode_id = id;
         self.status = "PLAYING".to_string();
-        // 切集：进度归零（新集起点），对齐 demo 播放器换源后重置
+        // 切集：position 归零（新集起点），duration 预填列表项自带值
+        // （消除 0 窗口，见 current_duration 注释）
         self.position = 0;
-        self.duration = 0;
+        self.duration = self.current_duration();
+        self.last_position_update = Some(std::time::Instant::now());
         true
     }
 
@@ -493,13 +602,19 @@ impl PlaylistState {
         self.current().map(|i| i.url.clone()).filter(|u| !u.is_empty())
     }
 
-    /// 完整 mediaInfo（PushMediaInfo / GetMediaInfo 响应）
+    /// 完整 mediaInfo（PushMediaInfo / GetMediaInfo 响应）。⚠️ 2026-08-25 崩溃堆栈实锤：
+    /// 抖音端（aweme.lite）处理 PushMediaInfo 时 `IllegalStateException: must not
+    /// be null`（ByteCastSourceController$excuteBdleMessage）——**demo 原样回传同样闪退**，
+    /// 极速版对 dramaBeans 条目做必填字段检查（顶层 dramaId / urlBeans）。原样回传
+    /// 抖音自己下发的条目不可靠（AddDramaList 追加的条目可能结构不完整/字段嵌套）。
+    /// 因此**规范化每条**（见 normalize_bean）：确保顶层 dramaId 与 urlBeans 存在，
+    /// 用 PlaylistItem 提取值兜底，同时保留原始全部字段。
     fn media_info(&self) -> Value {
         let beans: Vec<Value> = self
             .order
             .iter()
             .filter_map(|id| self.items.get(id))
-            .map(|i| i.raw.clone())
+            .map(|i| normalize_bean(i))
             .collect();
         json!({
             "dramaId": self.current_episode_id,
@@ -514,11 +629,30 @@ impl PlaylistState {
         })
     }
 
+    /// GetStatusInfo 回包——**严格对齐 demo PlaylistState.statusInfo() 形态**：
+    /// `duration` 恒 0、`position` 恒 0（demo 中 duration 无任何更新源、position
+    /// 仅 Seek 命令更新），只有 status/speed 是实时值。2026-08-25 真机实测教训：
+    /// 曾返回前端实时 duration（198167/300600），抖音端对 `duration>0` 会做
+    /// GetStatusInfo 回包——**返回真实播放进度与时长**（陈兄 2026-08-25 17:29
+    /// 明确要求，撤销"恒 0"形态）：duration 取内部字段（前端上报毫秒值）；
+    /// position 取内部字段 + **PLAYING 状态下按流逝时间推进**（1x、封顶
+    /// duration）——前端上报链路可能断续/卡顿（实测 position 卡死 559 被判定
+    /// 异常），服务端推进保证抖音端轮询永远看到进度在走；前端每次
+    /// update_progress / 切集重置基准。
     fn status_info(&self) -> Value {
+        let mut pos = self.position;
+        if self.status == "PLAYING" {
+            if let Some(t) = self.last_position_update {
+                let elapsed = t.elapsed().as_millis() as u64;
+                if elapsed > 0 {
+                    pos = (pos + elapsed).min(if self.duration > 0 { self.duration } else { u64::MAX });
+                }
+            }
+        }
         json!({
             "status": self.status,
             "duration": self.duration,
-            "position": self.position,
+            "position": pos,
             "speed": self.speed
         })
     }
@@ -727,23 +861,38 @@ impl PlaylistChannel {
 
     /// 播完/手动切集：切到下一项并返回新当前项（无下一项返回 None）。
     /// 防抖：1s 内不重复切（前端播完兜底 position=dur+1000 可能连报，且换集 STOP 兜底也走这里）。
-    pub fn next_and_get(&self) -> Option<PlaylistItem> {
-        let now = std::time::Instant::now();
-        let mut last = self.inner.last_auto_next.lock().unwrap();
-        if let Some(t) = *last {
-            if t.elapsed() < std::time::Duration::from_millis(1000) {
-                return None;
+    /// `notify=true` 时内部触发 on_play_request 回调（供普通通道切集路径用）；
+    /// `notify=false` 时只切集不回调（供 auto_next 用——它需要先做 addOn URL
+    /// 守卫再自行 set_uri/emit，避免守卫前回调已把非抖音 URL 播出去、且双 emit）。
+    /// 播完/手动切集：切到下一项并返回新当前项（无下一项返回 None）。
+    /// `notify=true` 时内部触发 on_play_request 回调（供普通通道切集路径用）；
+    /// `notify=false` 时只切集不回调（供 auto_next 用——它需要先做 addOn URL
+    /// 守卫再自行 set_uri/emit，避免守卫前回调已把非抖音 URL 播出去、且双 emit）。
+    /// `force=true` 跳过 1s 防抖（**手动切集**：TV 遥控 next 是用户明确意图，
+    /// 必须即时生效，否则会被播完自动切集刚触发过的防抖窗口吞掉——实测
+    /// "按了没反应、再按才切"就是防抖误吞）；`force=false` 保留防抖（播完
+    /// 自动切集：前端 position 连报可能重复触发，需 1s 内去重）。
+    pub fn next_and_get(&self, notify: bool, force: bool) -> Option<PlaylistItem> {
+        if !force {
+            let now = std::time::Instant::now();
+            let mut last = self.inner.last_auto_next.lock().unwrap();
+            if let Some(t) = *last {
+                if t.elapsed() < std::time::Duration::from_millis(1000) {
+                    return None;
+                }
             }
+            *last = Some(now);
         }
-        *last = Some(now);
         let mut st = self.inner.state.lock().unwrap();
         if !st.move_by(1) {
             return None;
         }
         let item = st.current().cloned();
         drop(st);
-        if let Some(i) = &item {
-            self.notify_play_request(i);
+        if notify {
+            if let Some(i) = &item {
+                self.notify_play_request(i);
+            }
         }
         item
     }
@@ -774,7 +923,48 @@ impl PlaylistChannel {
 
     /// 主动推送 PushMediaInfo 到所有客户端（手机重连后仍能拿到最新列表）
     pub async fn push_media_info(&self) {
-        let body = json!({ "cmd": "PushMediaInfo", "mediaInfo": self.inner.state.lock().unwrap().media_info() });
+        let info = self.inner.state.lock().unwrap().media_info();
+        let drama_id = info["dramaId"].as_str().unwrap_or("").to_string();
+        let beans = info["dramaBeans"].as_array().map(|a| a.len()).unwrap_or(0);
+        // 回包结构日志（2026-08-25 崩溃堆栈后加）：抖音端 excuteBdleMessage 对
+        // dramaBeans 条目做必填字段检查，缺失 → IllegalStateException: must not be null
+        // 闪退。打印当前集条目（dramaId 匹配）与首条目的结构，确认规范化后顶层
+        // dramaId/urlBeans 是否就位。
+        let cur_bean = info["dramaBeans"]
+            .as_array()
+            .and_then(|a| {
+                a.iter().find(|b| {
+                    b.get("dramaId").and_then(|d| d.as_str()) == Some(drama_id.as_str())
+                })
+            })
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let first_bean = info["dramaBeans"].get(0).cloned().unwrap_or(serde_json::Value::Null);
+        let summarize = |b: &Value| -> String {
+            let did = b.get("dramaId").and_then(|v| v.as_str()).unwrap_or("<null>");
+            let ub = b
+                .get("urlBeans")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let url = b
+                .get("urlBeans")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|u| u.get("url"))
+                .and_then(|u| u.as_str())
+                .map(|u| u.chars().take(48).collect::<String>())
+                .unwrap_or("<null>".into());
+            format!("dramaId={} urlBeans={} url0={}", did, ub, url)
+        };
+        eprintln!(
+            "[dlna_playlist] push_media_info → dramaId={} beans={} curBean[{}] firstBean[{}]",
+            drama_id,
+            beans,
+            if cur_bean.is_null() { "NOT-FOUND".to_string() } else { summarize(&cur_bean) },
+            summarize(&first_bean)
+        );
+        let body = json!({ "cmd": "PushMediaInfo", "mediaInfo": info });
         let frame = build_frame(&json!({ "encrypt": 0, "content": json!({
             "version": 1,
             "messageId": new_message_id(),
@@ -902,6 +1092,9 @@ impl PlaylistChannel {
                     guard.write_all(&resp_frame).await?;
                     guard.flush().await?;
                 }
+                // 命令自身需要推（Play/AddDramaList/切集命令）→ 回包后推一帧。
+                // 切集命令（PlayNextDrama 等）由抖音端自己发起 → 天然命令背书，
+                // 抖音端接受 PushMediaInfo 播单更新（2026-08-25 实测）。
                 if need_push {
                     self.push_media_info().await;
                 }
@@ -928,15 +1121,37 @@ impl PlaylistChannel {
         }
         let mut st = self.inner.state.lock().unwrap();
         match command {
-            "GetStatusInfo" => (json!({ "cmd": command, "statusInfo": st.status_info() }), false),
+            "GetStatusInfo" => {
+                let si = st.status_info();
+                // 回包内容日志：抖音端断投前最后一次轮询看到的值是退出判定依据
+                eprintln!(
+                    "[dlna_playlist] GetStatusInfo resp → {}",
+                    si.to_string().replace(' ', "")
+                );
+                (json!({ "cmd": command, "statusInfo": si }), false)
+            }
             "GetMediaInfo" => (json!({ "cmd": command, "mediaInfo": st.media_info() }), false),
             "GetStatusAndMediaInfo" => (
                 json!({ "cmd": command, "statusInfo": st.status_info(), "mediaInfo": st.media_info() }),
                 false,
             ),
             "GetVolume" => (json!({ "cmd": command, "volume": st.volume }), false),
-            "Play" | "AddDramaList" => {
-                st.apply_play(body);
+            "Play" => {
+                // 首次起播：current 切到 startDramaId/dramaId（demo 语义）
+                st.apply_play(body, false);
+                let item = st.current().cloned();
+                drop(st);
+                if let Some(i) = &item {
+                    self.notify_play_request(i);
+                }
+                (response, need_push)
+            }
+            "AddDramaList" => {
+                // 追加列表（预加载）：**不覆盖 current**——current 由"当前在播集"
+                // 决定（Play 命令或宿主 TV 切集已设定）。demo 覆盖是因为其场景
+                // startDramaId 恒等于 current（命令驱动、无外部切集）；本场景若
+                // 覆盖会把 TV 已切的新集打回旧集，前端被 emit 换源回退（实测乱）。
+                st.apply_play(body, true);
                 let item = st.current().cloned();
                 drop(st);
                 if let Some(i) = &item {
@@ -1174,6 +1389,34 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn normalize_bean_ensures_top_level_required_fields() {
+        // 防回归（2026-08-25 崩溃堆栈）：PushMediaInfo 的 dramaBeans 条目必须
+        // 有顶层 dramaId / urlBeans，否则抖音端（aweme.lite）excuteBdleMessage
+        // checkNotNull 崩溃。原样回传不可靠（demo 同样闪退）。
+        // ① 顶层 dramaId 缺失 → 用提取值补齐
+        let raw = json!({ "video": { "dramaId": "x1" }, "urlBeans": [{ "url": "http://x/1.mp4", "isDefault": true }] });
+        let item = extract_item(&raw, 0);
+        let bean = normalize_bean(&item);
+        assert_eq!(bean["dramaId"], "x1", "顶层 dramaId 补齐");
+        assert!(bean.get("urlBeans").is_some(), "urlBeans 保留");
+        // ② urlBeans 缺失 → 用提取 URL 构造标准条目
+        let raw2 = json!({ "dramaId": "x2", "url": "http://x/2.mp4" });
+        let item2 = extract_item(&raw2, 1);
+        let bean2 = normalize_bean(&item2);
+        assert_eq!(bean2["dramaId"], "x2");
+        assert_eq!(bean2["urlBeans"][0]["url"], "http://x/2.mp4");
+        assert_eq!(bean2["urlBeans"][0]["isDefault"], true);
+        // ③ 完整条目 → 原样保留不破坏
+        let raw3 = json!({ "dramaId": "x3", "urlBeans": [{ "url": "http://x/3.mp4", "isDefault": true }], "title": "t3" });
+        let item3 = extract_item(&raw3, 2);
+        let bean3 = normalize_bean(&item3);
+        assert_eq!(bean3["title"], "t3");
+        assert_eq!(bean3["dramaId"], "x3");
+        assert_eq!(bean3["urlBeans"][0]["url"], "http://x/3.mp4");
+    }
+
+    #[test]
     fn extract_item_picks_default_url() {
         let item = extract_item(&item_json("a", "http://x/a.mp4"), 0);
         assert_eq!(item.drama_id, "a");
@@ -1185,19 +1428,19 @@ mod tests {
     #[test]
     fn apply_play_merges_by_drama_id_keeping_order() {
         let mut st = PlaylistState::new();
-        st.apply_play(&json!({ "dramaId": "1", "dramaBeans": [item_json("1", "http://x/1.mp4")] }));
+        st.apply_play(&json!({ "dramaId": "1", "dramaBeans": [item_json("1", "http://x/1.mp4")] }), false);
         assert_eq!(st.len(), 1);
         assert_eq!(st.current_episode_id, "1");
 
         // AddDramaList 追加
         let add = json!({ "dramaBeans": [item_json("2", "http://x/2.mp4"), item_json("3", "http://x/3.mp4")] });
-        st.apply_play(&add);
+        st.apply_play(&add, true);
         assert_eq!(st.len(), 3);
         assert_eq!(st.current_episode_id, "1", "追加列表不清当前项");
 
         // 单项 Play 更新已存在 id 不重复计数
         let re_play = json!({ "dramaId": "2", "dramaBeans": [item_json("2", "http://x/2b.mp4")] });
-        st.apply_play(&re_play);
+        st.apply_play(&re_play, false);
         assert_eq!(st.len(), 3, "已存在 id 更新不重复计数");
         assert_eq!(st.current().unwrap().url, "http://x/2b.mp4");
     }
@@ -1205,7 +1448,7 @@ mod tests {
     #[test]
     fn move_by_selects_next_and_prev() {
         let mut st = PlaylistState::new();
-        st.apply_play(&json!({ "dramaBeans": [item_json("1", "u1"), item_json("2", "u2"), item_json("3", "u3")] }));
+        st.apply_play(&json!({ "dramaBeans": [item_json("1", "u1"), item_json("2", "u2"), item_json("3", "u3")] }), false);
         assert_eq!(st.current_episode_id, "1");
         assert!(st.move_by(1));
         assert_eq!(st.current_episode_id, "2");
@@ -1218,9 +1461,50 @@ mod tests {
     }
 
     #[test]
+    fn add_drama_list_does_not_override_current() {
+        // 防回归：TV 切集（move_by 到 2）后抖音端 AddDramaList（带旧 startDramaId=1）
+        // **不得**把 current 打回 1——否则前端被 emit 换源回退（实测乱）。
+        // demo 覆盖是因为其场景 startDramaId 恒等于 current；本场景有外部切集。
+        let mut st = PlaylistState::new();
+        st.apply_play(&json!({ "dramaBeans": [item_json("1", "u1"), item_json("2", "u2"), item_json("3", "u3")] }), false);
+        assert!(st.move_by(1));
+        assert_eq!(st.current_episode_id, "2", "TV 切到第 2 集");
+        // 抖音端 AddDramaList 预加载，startDramaId=1（它 UI 还显示第 1 集）
+        let add = json!({ "startDramaId": "1", "dramaBeans": [item_json("4", "u4"), item_json("5", "u5")] });
+        st.apply_play(&add, true);
+        assert_eq!(st.current_episode_id, "2", "AddDramaList 不覆盖 current（保留 TV 切集）");
+        assert_eq!(st.len(), 5, "列表追加成功");
+        // Play 命令（首次起播）仍遵循 startDramaId（demo 语义）
+        st.apply_play(&json!({ "startDramaId": "4", "dramaBeans": [item_json("4", "u4")] }), false);
+        assert_eq!(st.current_episode_id, "4", "Play 命令遵循 startDramaId");
+    }
+
+    #[test]
+    fn switch_episode_prefills_duration_from_item() {
+        // statusInfo **返回真实播放进度与时长**（陈兄 2026-08-25 17:29 要求）：
+        // duration/position 取内部字段——起播/切集时预填列表项值（或 0），
+        // 前端实时上报（update_progress）覆盖为精确毫秒值。
+        let mut st = PlaylistState::new();
+        st.apply_play(&json!({ "dramaBeans": [item_json("1", "u1"), item_json("2", "u2")] }), false);
+        assert_eq!(st.status_info()["status"], "PLAYING");
+        assert_eq!(st.status_info()["duration"], 8000, "起播即预填列表项时长");
+        assert_eq!(st.status_info()["position"], 0);
+        assert_eq!(st.duration, 8000, "内部 duration 起播即预填列表项值");
+        assert!(st.move_by(1));
+        assert_eq!(st.status_info()["duration"], 8000, "切集后预填新集值");
+        assert_eq!(st.status_info()["position"], 0, "切集后 position 归零");
+        // 前端实时上报覆盖内部字段 → statusInfo 返回实时值
+        st.update_progress(300200, 102301);
+        assert_eq!(st.duration, 300200);
+        assert_eq!(st.position, 102301);
+        assert_eq!(st.status_info()["duration"], 300200, "statusInfo 返回实时时长");
+        assert_eq!(st.status_info()["position"], 102301, "statusInfo 返回实时进度");
+    }
+
+    #[test]
     fn clear_resets_all() {
         let mut st = PlaylistState::new();
-        st.apply_play(&json!({ "dramaBeans": [item_json("1", "u1")] }));
+        st.apply_play(&json!({ "dramaBeans": [item_json("1", "u1")] }), false);
         st.clear();
         assert!(!st.has_items());
         assert!(st.current_episode_id.is_empty());
@@ -1228,9 +1512,30 @@ mod tests {
     }
 
     #[test]
+    fn status_info_position_advances_with_time() {
+        // 防回归（2026-08-25 实测 position 卡死 559）：PLAYING 状态下 status_info()
+        // 的 position 必须按流逝时间推进（1x、封顶 duration）——抖音端轮询才能
+        // 看到进度在走；前端上报/切集重置基准。
+        let mut st = PlaylistState::new();
+        st.apply_play(&json!({ "dramaBeans": [item_json("1", "u1")] }), false);
+        st.update_progress(300_000, 10_000);
+        let p0 = st.status_info()["position"].as_u64().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let p1 = st.status_info()["position"].as_u64().unwrap();
+        assert!(p1 > p0, "position 随时间推进（{p0} → {p1}）");
+        // 封顶 duration：把基准时间拉长后推进不超过 duration
+        let cap = st.status_info()["position"].as_u64().unwrap();
+        assert!(cap <= 300_000, "position 封顶 duration");
+        // 前端新上报重置基准 → 从新值重新推进
+        st.update_progress(300_000, 20_000);
+        let q0 = st.status_info()["position"].as_u64().unwrap();
+        assert!(q0 >= 20_000 && q0 < 20_500, "上报后基准重置（{q0}）");
+    }
+
+    #[test]
     fn delete_by_ids() {
         let mut st = PlaylistState::new();
-        st.apply_play(&json!({ "dramaBeans": [item_json("1", "u1"), item_json("2", "u2"), item_json("3", "u3")] }));
+        st.apply_play(&json!({ "dramaBeans": [item_json("1", "u1"), item_json("2", "u2"), item_json("3", "u3")] }), false);
         st.delete(&json!({ "dramaIds": ["2"] }));
         assert_eq!(st.len(), 2);
         assert!(st.items.get("2").is_none());
@@ -1373,12 +1678,12 @@ mod tests {
         assert_eq!(played.lock().unwrap()[1], "http://x/2.mp4");
 
         // 5. 播完自动切集（宿主调用 next_and_get）→ 切到 3
-        let next = ch.next_and_get();
+        let next = ch.next_and_get(true, false);
         assert!(next.is_some());
         assert_eq!(next.unwrap().url, "http://x/3.mp4");
         assert_eq!(played.lock().unwrap()[2], "http://x/3.mp4");
         // 列表末尾无下一项
-        assert!(ch.next_and_get().is_none());
+        assert!(ch.next_and_get(true, false).is_none());
 
         // 6. ClearDramaList → 列表清空
         send_frame(

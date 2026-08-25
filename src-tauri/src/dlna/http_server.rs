@@ -171,14 +171,20 @@ async fn handle_conn(
                     // ⚠️ device-desc.xml 响应重复附加抖音播放列表扩展头（对齐 dlna_demo）：
                     // 无论手机在 SSDP 结果阶段还是读设备 XML 阶段做能力判断，都能看到一致数据。
                     // 抖音指纹 SERVER 只用于描述文档响应；scpd 等普通路径保持标准 DLNA SERVER。
-                    let (server, extra) = if path == "/device-desc.xml" {
-                        (
-                            crate::dlna::playlist::wire::DOUYIN_SERVER,
-                            crate::dlna::playlist::discovery_headers(control_port, device_id, service_id),
-                        )
-                    } else {
-                        (crate::dlna::playlist::wire::STD_SERVER, Vec::new())
-                    };
+                    // 列表功能关闭（control_port=None，默认）→ 标准指纹 + 无扩展头，纯公版。
+                    let (server, extra) =
+                        if path == "/device-desc.xml" && control_port.is_some() {
+                            (
+                                crate::dlna::playlist::wire::DOUYIN_SERVER,
+                                crate::dlna::playlist::discovery_headers(
+                                    control_port,
+                                    device_id,
+                                    service_id,
+                                ),
+                            )
+                        } else {
+                            (crate::dlna::playlist::wire::STD_SERVER, Vec::new())
+                        };
                     write_response(&mut stream, 200, &ct, &b, conn_keep_alive, server, &extra).await?
                 }
                 None => {

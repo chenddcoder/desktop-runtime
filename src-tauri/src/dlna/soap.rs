@@ -258,13 +258,15 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             // addOn 激活判据统一收敛到 playlist::is_douyin_url（9 域名 + ott_cast），
             // 与列表模式激活（mod.rs on_play_request）共用同一规则，避免两份漂移。
             let is_douyin_source = crate::dlna::playlist::is_douyin_url(&uri);
-            // ⚠️ 列表通道模式（抖音 BDLE 播放列表已建立）：**必须如实报告真实进度**，
-            // 禁用下方全部伪装（fake_short / force_complete）。原因：切集由服务端主导
-            // （前端上报 pos>=dur → auto_next 本地切集 + PushMediaInfo 同步手机），若
-            // SOAP 层继续伪装"播完超时"，抖音客户端自己也会判定播完发起第二路切集
-            // （Stop→SetAVTransportURI→Play），与服务端切集形成**双路竞态**——实测
-            // 表现为"切下一个后抖音退出投屏"。列表模式下客户端只消费 PushMediaInfo
-            // 播单更新，不再靠 GetPositionInfo 播完信号切集。
+            // ⚠️ 列表通道模式（抖音 BDLE 播放列表已建立）下的切集策略（2026-08-25 铁证）：
+            // **服务端绝不主动切集**（前端上报 pos>=dur → auto_next 本地 move + 无命令
+            // PushMediaInfo 会让抖音端判定"播单被外部篡改"而退出投屏，实测 client
+            // disconnected；而抖音自己发 AddDramaList/PlayNextDrama 命令后的 push 它接受）。
+            // 正确姿势 = 与非列表模式一致：**如实报告实时进度，按下切集（force_complete）
+            // 时返回 dur+overshoot（"返回到头"）**，让抖音端轮询 GetPositionInfo 判定
+            // 播完 → 自己发命令（PlayNextDrama/SetAVTransportURI）→ 服务端 move + 命令
+            // 背书 push + emit 前端换源。因此 force_complete 分支**不再被 playlist_mode
+            // 禁用**（fake_short 短视频伪装仍仅非列表场景，列表集长通常 >6s）。
             let playlist_mode = av.playlist_mode();
             let fake_short = !playlist_mode && is_douyin_source && dur > 0 && dur < 6000;
             let reported_dur = if fake_short { 6000 } else { dur };
@@ -283,13 +285,12 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
                 // 其余情况（播放中）：保留真实进度（<6s）
             } else if !playlist_mode && av.force_complete() && dur > 0 {
                 // 强制完成逻辑（TV 下键/手动切集，前端发 force_complete 信号）：
-                // **与安卓端完全对齐——瞬间跳变到超出总时长**（RelTime = dur + OVERSHOOT）。
-                // 安卓抖音实测：position=dur+1000 必切集（历史实证）。iOS 抖音按下后
-                // 同样能触发切集（客户端切集流程 Stop→SetAVTransportURI→Play 已实测走通，
-                // 2026-08-25；换集后 tvcast 跟随播放见 casting 页 onDlnaStop 延迟退出修复）。
-                // 上一版"平滑递增模拟自然播完曲线"方案已按用户要求废弃（2026-08-25）——
-                // 两端统一走"切下进度到头，客户端自动切下一个"。
-                // 抖音客户端有"先确认在播（上次回报进度>1s）再接受播完信号"的判断：
+                // **仅非列表模式**——列表模式下切集由服务端 auto_next 主导（move +
+                // PushMediaInfo，normalize_bean 保证不崩），SOAP 层若同时伪装播完，
+                // 抖音客户端也会判定播完发起第二路切集，形成**双路竞态**（实测
+                // 表现为"切下一个后抖音退出"）。2026-08-25 再实测：抖音极速版
+                // **列表模式不响应 SOAP 播完信号**（按 force_complete 后干等不动作），
+                // 列表模式统一走服务端切集，本分支仅非列表投屏使用。
                 //   - 上次回报 <1s（客户端未确认在播）→ 先给 >1s 过渡值（2s）确认在播
                 //   - 上次回报 ≥1s → **直接返回超出总时长的进度**（RelTime = dur+1000
                 //     > TrackDuration，整秒化后两者恒差 1s，判定不受影响）
@@ -574,27 +575,34 @@ mod tests {
     /// fake_short / force_complete 伪装全部禁用——否则客户端自己也判定"播完"发起
     /// 第二路切集（Stop→SetAVTransportURI→Play），与服务端 auto_next 形成双路竞态
     /// （实测表现：切下一个后抖音退出投屏）。列表模式下客户端只消费 PushMediaInfo
-    /// 播单更新，不再依赖 GetPositionInfo 播完信号切集。
+    /// 切集策略（2026-08-25 铁证）：抖音极速版**列表模式不响应 SOAP 播完信号**，
+    /// 列表模式切集统一走服务端 auto_next（move + PushMediaInfo，normalize_bean
+    /// 保证不崩）；GetPositionInfo 平时如实报告、force_complete 在列表模式禁用
+    /// （防双路竞态——客户端判定播完 + 服务端切集 = 两路切集）。force_complete
+    /// 伪装仅非列表投屏使用。
     #[test]
     fn playlist_mode_reports_real_progress() {
         let av = crate::dlna::av_transport::AvTransport::new();
-        // 抖音短视频源（<6s）+ 列表模式 → fake_short 必须失效，如实报 5s
+        // 抖音短视频源（<6s）+ 列表模式 → fake_short 仍失效（列表集长一般 >6s，
+        // 短视频伪装只服务非列表单集投屏），如实报 5s
         av.set_uri("http://v.douyinvod.com/x/short.mp4", "");
-        av.update_duration(5_000);
+        av.update_duration(5_500); // 非整秒
         av.update_position(4_500);
         av.set_playlist_mode(true);
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(
             m.get("TrackDuration").map(|s| s.as_str()),
             Some("00:00:05"),
-            "列表模式下 TrackDuration 必须如实（不得伪装 6s）"
+            "列表模式下 TrackDuration 如实（整秒化 5.5s→5s，不得伪装 6s）"
         );
         assert_eq!(
             m.get("RelTime").map(|s| s.as_str()),
             Some("00:00:04.500"),
             "列表模式播放中如实报告真实进度"
         );
-        // 列表模式 + force_complete 信号 → 必须失效，不得返回 dur+OVERSHOOT
+        // 列表模式 + force_complete → **必须失效**（如实报告，不得伪装播完）——
+        // 切集由服务端 auto_next 主导，SOAP 伪装会形成双路竞态
+        av.set_last_reported(4_500);
         av.set_force_complete();
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(
@@ -602,8 +610,9 @@ mod tests {
             Some("00:00:04.500"),
             "列表模式下 force_complete 伪装必须禁用"
         );
-        // 退出列表模式 → 恢复伪装链路（短视频 fake_short 恢复 6s）
+        // 退出列表模式 → 恢复 fake_short 伪装（短视频 6s 虚拟时长，非列表场景）
         av.set_playlist_mode(false);
+        av.clear_force_complete();
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(
             m.get("TrackDuration").map(|s| s.as_str()),
