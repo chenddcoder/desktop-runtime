@@ -84,22 +84,53 @@ pub fn dlna_status() -> DlnaStatus {
     DlnaStatus { running, port, uuid }
 }
 
-/// 获取本机局域网 IPv4（UDP connect 技巧：连一个外部地址，取本地出口地址）。
-/// 加 3s 超时：没外网 / 没默认路由时会无限阻塞，会把整个 DLNA 启动流程卡死。
-async fn get_local_ip() -> std::io::Result<String> {
-    let fut = async {
-        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        socket.connect("8.8.8.8:80").await?;
-        let addr = socket.local_addr()?;
-        Ok::<String, std::io::Error>(addr.ip().to_string())
+/// 枚举本机所有活跃的非回环 IPv4 接口地址（解析 `ifconfig` 输出，零依赖）。
+///
+/// 过滤虚拟/链路接口（lo/utun/awdl/llw/bridge/gif/stf/ipsec/tun/tap/vmenet/vmnet/
+/// anpi/pdp_ip 及 link-local 169.254），真实接口（en*/eth* 等）排前。
+/// 多网卡环境（WiFi + USB 网卡/虚拟机网卡）下**不能**用"连 8.8.8.8 取默认出口 IP"——
+/// 默认出口可能是非 WiFi 接口（实测 40.64 WiFi + 55.29 第二接口时出口 IP=55.29），
+/// SSDP 需 join **全部**接口的多播组，LOCATION 用第一个真实接口 IP。
+pub(crate) fn list_local_ipv4() -> Vec<String> {
+    use std::process::Command;
+    let out = match Command::new("ifconfig").output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => return Vec::new(),
     };
-    match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
-        Ok(r) => r,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "get_local_ip timeout (no default route to 8.8.8.8?)",
-        )),
+    let skip_iface = |name: &str| -> bool {
+        [
+            "lo", "utun", "awdl", "llw", "bridge", "gif", "stf", "ipsec", "tun", "tap",
+            "vmenet", "vmnet", "anpi", "pdp_ip",
+        ]
+        .iter()
+        .any(|k| name.starts_with(k))
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new(); // (iface, ip)
+    let mut cur: Option<String> = None;
+    for line in out.lines() {
+        let t = line.trim_start();
+        if t.contains(": flags=") {
+            cur = t.split(':').next().map(|s| s.to_string());
+        } else if let Some(rest) = t.strip_prefix("inet ") {
+            let ip = rest.split_whitespace().next().unwrap_or("");
+            if !ip.is_empty() && !ip.starts_with("127.") && !ip.starts_with("169.254.") {
+                if let Some(name) = &cur {
+                    if !skip_iface(name) && !pairs.iter().any(|(_, p)| p == ip) {
+                        pairs.push((name.clone(), ip.to_string()));
+                    }
+                }
+            }
+        }
     }
+    // 排序：en*（WiFi/以太网）优先，其余按名；长度优先避免 en10 < en2 字典序问题
+    pairs.sort_by(|a, b| {
+        let rank = |n: &str| if n.starts_with("en") { 0 } else { 1 };
+        rank(&a.0)
+            .cmp(&rank(&b.0))
+            .then_with(|| a.0.len().cmp(&b.0.len()))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    pairs.into_iter().map(|(_, ip)| ip).collect()
 }
 
 /// 失败时尽量 dump 谁占了端口（mac 用 lsof / linux 用 ss），便于一眼看到 Plex / 上次进程残留。
@@ -165,17 +196,18 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
     }
 
     eprintln!("[dlna_start] getting local IP...");
-    let local_ip = match get_local_ip().await {
-        Ok(ip) => {
-            eprintln!("[dlna_start] local IP = {ip}");
-            ip
+    let ifaces = list_local_ipv4();
+    let local_ip = match ifaces.first() {
+        Some(ip) => {
+            eprintln!("[dlna_start] local IP = {ip} (ifaces={ifaces:?})");
+            ip.clone()
         }
-        Err(e) => {
-            eprintln!("[dlna_start] get_local_ip failed: kind={:?}, detail={}", e.kind(), e);
-            return Err(format!(
-                "【步骤1/3 获取本机IP】失败 kind={:?} detail={} · 可能原因: ① 当前无默认路由到 8.8.8.8(网线/拔掉时) ② macOS 在某些网络配置下 UDP connect 失败 ③ 防火墙拦截(罕见)",
-                e.kind(), e
-            ));
+        None => {
+            eprintln!("[dlna_start] list_local_ipv4 empty (no active non-loopback IPv4)");
+            return Err(
+                "【步骤1/3 获取本机IP】失败: 未发现活跃的非回环 IPv4 接口（ifconfig 无结果？网卡未连网络？）"
+                    .into(),
+            );
         }
     };
     let uuid = format!("quickapp-desktop-{}", uuid_simple());
@@ -301,8 +333,8 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
     });
 
     // —— SSDP（UDP 多播发现，替代 EndpointModule 的 UDP 监听）——
-    eprintln!("[dlna_start] binding SSDP on 239.255.255.250:1900 (iface={local_ip})");
-    let socket = match ssdp::bind_ssdp(&local_ip).await {
+    eprintln!("[dlna_start] binding SSDP on 239.255.255.250:1900 (ifaces={ifaces:?})");
+    let socket = match ssdp::bind_ssdp(&ifaces).await {
         Ok(s) => s,
         Err(e) => {
             // SSDP 起不来就关掉已起的 HTTP，避免半拉子状态
@@ -327,16 +359,22 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
     let control_ssdp = control_port;
     let device_id_ssdp = device_id.clone();
     let service_id_ssdp = service_id.clone();
+    // WiFi 切换时 SSDP 重绑定成功 → 回调同步 playlist 通道设备 IP（GetDeviceInfo/PushMediaInfo 上报新 IP）
+    let pl_ssdp = pl_channel.clone();
     tokio::spawn(async move {
         ssdp::run_ssdp(
             app_ssdp,
             socket,
             &uuid_ssdp,
-            &local_ip_ssdp,
+            local_ip_ssdp,
             http_port,
             Some(control_ssdp),
             &device_id_ssdp,
             &service_id_ssdp,
+            Box::new(move |new_ip: &str| {
+                eprintln!("[dlna_start] SSDP rebound, sync playlist device ip={new_ip}");
+                pl_ssdp.set_ip(new_ip.to_string());
+            }),
             &mut shutdown_ssdp,
         )
         .await;
@@ -538,15 +576,7 @@ pub fn dlna_debug_log(msg: String, data: Option<serde_json::Value>) -> Result<()
 
 /// 同步取本机局域网 IPv4（仅用于默认名兜底，失败回空串）。
 fn get_local_ip_now() -> String {
-    use std::net::UdpSocket;
-    let sock = match UdpSocket::bind("0.0.0.0:0") {
-        Ok(s) => s,
-        Err(_) => return String::new(),
-    };
-    match sock.connect("8.8.8.8:80") {
-        Ok(_) => sock.local_addr().map(|a| a.ip().to_string()).unwrap_or_default(),
-        Err(_) => String::new(),
-    }
+    list_local_ipv4().into_iter().next().unwrap_or_default()
 }
 
 /// 获取 DLNA 设备名。返回顺序：已确定 → 持久化 → 默认名。

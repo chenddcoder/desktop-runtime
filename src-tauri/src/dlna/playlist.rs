@@ -603,7 +603,8 @@ pub struct PlaylistChannel {
 
 struct ChannelInner {
     state: Mutex<PlaylistState>,
-    device: PlaylistDeviceIdentity,
+    /// 设备身份（ip 会随 WiFi 切换热更新，见 set_ip；其余字段生命周期内不变）
+    device: Mutex<PlaylistDeviceIdentity>,
     crypto: SessionCrypto,
     /// 已连接客户端的写半（响应 + PushMediaInfo 广播共用；每连接一把锁保证帧不交错）
     clients: tokio::sync::Mutex<Vec<(std::net::SocketAddr, Arc<tokio::sync::Mutex<OwnedWriteHalf>>)>>,
@@ -638,7 +639,7 @@ impl PlaylistChannel {
         let channel = Arc::new(PlaylistChannel {
             inner: Arc::new(ChannelInner {
                 state: Mutex::new(PlaylistState::new()),
-                device,
+                device: Mutex::new(device),
                 crypto: SessionCrypto::new(),
                 clients: tokio::sync::Mutex::new(Vec::new()),
                 last_notified_url: Mutex::new(String::new()),
@@ -654,13 +655,20 @@ impl PlaylistChannel {
         });
         eprintln!(
             "[dlna_playlist] channel started host={} port={} frame=uint32LE+JSON crypto=X25519/AES-128-GCM",
-            channel.inner.device.ip, port
+            channel.inner.device.lock().unwrap().ip, port
         );
         Ok(channel)
     }
 
     pub fn control_port(&self) -> u16 {
         self.inner.port.lock().unwrap().unwrap_or(0)
+    }
+
+    /// WiFi 切换后热更新设备 IP（宿主在 SSDP 重绑定成功后回调）。
+    /// 后续 GetDeviceInfo 握手 / PushMediaInfo 上报即携带新 IP，避免手机端
+    /// 列表通道拿着旧 IP 连不上。
+    pub fn set_ip(&self, ip: String) {
+        self.inner.device.lock().unwrap().ip = ip;
     }
 
     /// 停止：关闭监听与所有客户端连接，清空列表。
@@ -1027,7 +1035,7 @@ impl PlaylistChannel {
     }
 
     fn device_info(&self) -> Value {
-        let d = &self.inner.device;
+        let d = self.inner.device.lock().unwrap();
         json!({
             "deviceInfo": {
                 "ip": d.ip,

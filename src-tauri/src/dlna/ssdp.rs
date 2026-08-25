@@ -4,6 +4,7 @@
 
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use socket2::{Domain, Socket, Type};
@@ -16,13 +17,17 @@ pub const SSDP_PORT: u16 = 1900;
 
 /// 绑定 1900 多播端口并加入组。
 ///
-/// ⚠️ macOS / BSD 上必须显式设 `SO_REUSEADDR` 与 `SO_REUSEPORT`，否则同主机
-/// 任何一个 UPnP/DLNA 服务（Plex / Jellyfin / Bonjour / 上次没死干净的实例）
-/// 占住 1900 我们就 EADDRINUSE，即便 9 没人 9 是它自己。这两个 option
-/// 允许多 socket 共享多播端口的"扇出"，是 macOS 上 SSDP 的标配。
+/// ⚠️ macOS / BSD 上必须显式设 `SO_REUSEADDR`，否则同主机任何一个
+/// UPnP/DLNA 服务（Plex / Jellyfin / Bonjour / 上次没死干净的实例）
+/// 占住 1900 我们就 EADDRINUSE。注意：对通配地址 `0.0.0.0:1900`，macOS 的
+/// SO_REUSEADDR **不**允许同进程双 socket 共存（实测重建报 os error 48）——
+/// 重建必须**先 drop 旧 fd 再 bind**（见 run_ssdp）。
 ///
-/// `local_ip` 为网卡 IPv4，作为加入多播组的接口（macOS 不能用 0.0.0.0）。
-pub async fn bind_ssdp(local_ip: &str) -> std::io::Result<UdpSocket> {
+/// `ifaces` 为本机所有活跃网卡 IPv4：逐个 `join_multicast_v4` 加入多播组，
+/// 保证 WiFi 切换 / 多网卡（WiFi + USB 网卡）下**任何网段**的手机都能收到
+/// M-SEARCH（macOS 多播组成员资格按接口绑定，只 join 一个接口则其他网卡收不到）。
+/// 单个接口 join 失败（如接口刚失效）仅跳过不整体失败；全部失败才返回 Err。
+pub async fn bind_ssdp(ifaces: &[String]) -> std::io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, None)?;
     // macOS / BSD 上 SO_REUSEADDR 已足以允许多 socket / 多进程共享多播端口扇出，
     // 这是 macOS 上 SSDP 接收的标配（plist / gmrender-resurrect / libdnp 都这么写）。
@@ -36,8 +41,21 @@ pub async fn bind_ssdp(local_ip: &str) -> std::io::Result<UdpSocket> {
     let std_sock: std::net::UdpSocket = sock.into();
     let socket = UdpSocket::from_std(std_sock)?;
     let multi = Ipv4Addr::from_str(SSDP_MULTICAST_ADDR).unwrap();
-    let iface = Ipv4Addr::from_str(local_ip).unwrap_or(Ipv4Addr::UNSPECIFIED);
-    socket.join_multicast_v4(multi, iface)?;
+    let mut joined = 0usize;
+    for iface in ifaces {
+        if let Ok(ip) = Ipv4Addr::from_str(iface) {
+            match socket.join_multicast_v4(multi, ip) {
+                Ok(()) => joined += 1,
+                Err(e) => eprintln!("[dlna_ssdp] join multicast on {iface} failed (skip): {e}"),
+            }
+        }
+    }
+    if joined == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no interface could join multicast group",
+        ));
+    }
     Ok(socket)
 }
 
@@ -45,28 +63,79 @@ pub async fn bind_ssdp(local_ip: &str) -> std::io::Result<UdpSocket> {
 /// `control_port`（BDLEPORT 扩展头）/`device_id`（UID）/`service_id`（SERVICEID）为
 /// 抖音播放列表通道的发现头：只有带这些头的 M-SEARCH 响应 + description.xml 响应，
 /// 抖音手机端才会连列表 TCP 端口（对齐 dlna_demo 增强发现）。
+///
+/// ⚠️ WiFi 切换热重建：socket 以 `Arc<Mutex<Option<UdpSocket>>>` 共享持有。
+/// 循环内每 5s 枚举本机真实接口（list_local_ipv4，多网卡下以首个真实接口为 primary），
+/// primary 变化时重建 socket：**先 drop 旧 fd 再 bind**（macOS 通配地址 0.0.0.0:1900
+/// 不允许双 socket 共存，实测重建 EADDRINUSE os error 48），重新 join 全部接口的
+/// 多播组并立即广播 NOTIFY alive，同时回调 `on_ip_changed` 让宿主同步更新 playlist
+/// 通道的设备 IP —— 否则切 WiFi 后 LOCATION 仍指向旧 IP，手机 GET device-desc.xml
+/// 必失败 → "搜不到设备"。不用"连 8.8.8.8 取默认出口 IP"判定：多网卡（WiFi +
+/// USB 网卡/虚拟机网卡）下默认出口可能是非 WiFi 接口（实测 40.64 WiFi + 55.29
+/// 第二接口时拿到 55.29），会误判变化并把 LOCATION 指到手机不可达的网段。
 pub async fn run_ssdp(
     app: AppHandle,
     socket: UdpSocket,
     uuid: &str,
-    local_ip: &str,
+    mut local_ip: String,
     http_port: u16,
     control_port: Option<u16>,
     device_id: &str,
     service_id: &str,
+    on_ip_changed: Box<dyn FnMut(&str) + Send + Sync + 'static>,
     shutdown: &mut broadcast::Receiver<()>,
 ) {
-    let _ = send_notify(&socket, uuid, local_ip, http_port, control_port, device_id, service_id).await;
+    let shared: Arc<tokio::sync::Mutex<Option<UdpSocket>>> =
+        Arc::new(tokio::sync::Mutex::new(Some(socket)));
+    let _ = notify_all(&shared, uuid, &local_ip, http_port, control_port, device_id, service_id).await;
 
     let mut interval = tokio::time::interval(Duration::from_secs(30));
+    let mut ip_check = tokio::time::interval(Duration::from_secs(5));
+    let mut on_ip_changed = on_ip_changed;
     let mut buf = [0u8; 4096];
     loop {
         tokio::select! {
             _ = shutdown.recv() => break,
-            _ = interval.tick() => {
-                let _ = send_notify(&socket, uuid, local_ip, http_port, control_port, device_id, service_id).await;
+            _ = ip_check.tick() => {
+                let ifaces = crate::dlna::list_local_ipv4();
+                let primary = ifaces.first().cloned().unwrap_or_default();
+                if primary.is_empty() {
+                    eprintln!("[dlna_ssdp] ip probe failed (no active interface), keep current {local_ip}");
+                    continue;
+                }
+                if primary != local_ip {
+                    eprintln!("[dlna_ssdp] IP changed {local_ip} -> {primary}, rebinding multicast...");
+                    // 必须先释放旧 fd：macOS 通配地址 0.0.0.0:1900 不允许双 socket 共存
+                    // （SO_REUSEADDR 对通配不生效，实测 os error 48）。
+                    *shared.lock().await = None;
+                    match bind_ssdp(&ifaces).await {
+                        Ok(s) => {
+                            *shared.lock().await = Some(s);
+                            local_ip = primary;
+                            on_ip_changed(&local_ip);
+                            eprintln!("[dlna_ssdp] rebound on {local_ip}, announcing alive");
+                            notify_all(&shared, uuid, &local_ip, http_port, control_port, device_id, service_id).await;
+                        }
+                        Err(e) => {
+                            // 重建失败：尝试用旧 IP 恢复（旧接口可能仍有效，双网卡兜底）
+                            eprintln!("[dlna_ssdp] rebind failed: {e}, restoring old socket...");
+                            match bind_ssdp(&[local_ip.clone()]).await {
+                                Ok(s) => {
+                                    *shared.lock().await = Some(s);
+                                    eprintln!("[dlna_ssdp] restored on {local_ip}");
+                                }
+                                Err(e2) => {
+                                    eprintln!("[dlna_ssdp] restore failed too: {e2}, ssdp dead until next probe");
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            res = socket.recv_from(&mut buf) => {
+            _ = interval.tick() => {
+                notify_all(&shared, uuid, &local_ip, http_port, control_port, device_id, service_id).await;
+            }
+            res = recv_packet(&shared, &mut buf) => {
                 if let Ok((n, addr)) = res {
                     let data = String::from_utf8_lossy(&buf[..n]);
                     // 排查日志：收到 M-SEARCH 即打印来源与 ST（用于判断"搜不到设备"是
@@ -84,13 +153,19 @@ pub async fn run_ssdp(
                             "st": st,
                         }),
                     );
-                    if let Some(responses) = handle_msearch(&data, uuid, local_ip, http_port, control_port, device_id, service_id) {
+                    if let Some(responses) = handle_msearch(&data, uuid, &local_ip, http_port, control_port, device_id, service_id) {
                         // 随机 0-100ms 延迟再回复，避免同网段风暴（与 TS 版一致）
                         let delay = Duration::from_millis((system_micros() % 100) as u64);
                         tokio::time::sleep(delay).await;
                         for resp in &responses {
                             // ① 单播响应（规范路径；但 ARP 不可达的虚拟网卡客户端收不到）
-                            let single = socket.send_to(resp.as_bytes(), addr).await;
+                            let single = {
+                                let guard = shared.lock().await;
+                                match guard.as_ref() {
+                                    Some(s) => s.send_to(resp.as_bytes(), addr).await,
+                                    None => Ok(0),
+                                }
+                            };
                             eprintln!("[dlna_ssdp] M-SEARCH respond to={addr} st={st:?} send={single:?}");
                             // ② 响应同时发多播组（兼容层保底）：SSDP 客户端加入
                             //    239.255.255.250:1900 组后能收到发往组的所有包（多播不依赖 ARP）。
@@ -98,9 +173,13 @@ pub async fn run_ssdp(
                             //    EHOSTUNREACH/Host is down）→ 单播响应永远到不了，设备搜不到。
                             //    多播响应让客户端拿到 LOCATION 后主动 GET device-desc（出站
                             //    由客户端发起 ARP，能通）→ 设备可被发现。
-                            let mcast = socket
-                                .send_to(resp.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT))
-                                .await;
+                            let mcast = {
+                                let guard = shared.lock().await;
+                                match guard.as_ref() {
+                                    Some(s) => s.send_to(resp.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT)).await,
+                                    None => Ok(0),
+                                }
+                            };
                             if let Err(e) = &mcast {
                                 eprintln!("[dlna_ssdp] M-SEARCH respond multicast failed: {e}");
                             }
@@ -108,10 +187,14 @@ pub async fn run_ssdp(
                         // ③ 补发多播 NOTIFY alive：部分客户端只监听多播主动广播。
                         let location = format!("http://{local_ip}:{http_port}/device-desc.xml");
                         for msg in build_notify_messages(uuid, &location, control_port, device_id, service_id) {
-                            if let Err(e) = socket
-                                .send_to(msg.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT))
-                                .await
-                            {
+                            let r = {
+                                let guard = shared.lock().await;
+                                match guard.as_ref() {
+                                    Some(s) => s.send_to(msg.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT)).await,
+                                    None => Ok(0),
+                                }
+                            };
+                            if let Err(e) = r {
                                 eprintln!("[dlna_ssdp] NOTIFY multicast send failed: {e}");
                                 break;
                             }
@@ -120,6 +203,33 @@ pub async fn run_ssdp(
                 }
             }
         }
+    }
+}
+
+/// 从共享 socket 收包；重建期间 socket 为 None 时挂起（等下一个事件）。
+async fn recv_packet(
+    shared: &Arc<tokio::sync::Mutex<Option<UdpSocket>>>,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, std::net::SocketAddr)> {
+    let mut guard = shared.lock().await;
+    match guard.as_mut() {
+        Some(s) => s.recv_from(buf).await,
+        None => std::future::pending::<std::io::Result<(usize, std::net::SocketAddr)>>().await,
+    }
+}
+
+/// 对当前共享 socket 广播 3 轮 NOTIFY alive（socket 为空时静默跳过）。
+async fn notify_all(
+    shared: &Arc<tokio::sync::Mutex<Option<UdpSocket>>>,
+    uuid: &str,
+    local_ip: &str,
+    http_port: u16,
+    control_port: Option<u16>,
+    device_id: &str,
+    service_id: &str,
+) {
+    if let Some(s) = shared.lock().await.as_ref() {
+        let _ = send_notify(s, uuid, local_ip, http_port, control_port, device_id, service_id).await;
     }
 }
 
@@ -368,7 +478,7 @@ mod tests {
     #[ignore]
     async fn bind_ssdp_real_port() {
         // 沙箱 / CI 通常没有 Plex 等干扰，但 1900 可能被容器本身占；这里忽略。
-        let r = bind_ssdp("127.0.0.1").await;
+        let r = bind_ssdp(&["127.0.0.1".to_string()]).await;
         assert!(
             r.is_ok(),
             "bind_ssdp(127.0.0.1) failed -> 沙箱/CI 端口受限不算 bug，本机 `cargo test bind_ssdp_real_port -- --ignored` 复跑。 {:?}",
