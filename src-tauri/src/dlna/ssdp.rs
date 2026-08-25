@@ -42,15 +42,21 @@ pub async fn bind_ssdp(local_ip: &str) -> std::io::Result<UdpSocket> {
 }
 
 /// 运行 SSDP：立即发 3 轮 NOTIFY alive，随后每 30s 周期广播，并应答收到的 M-SEARCH。
+/// `control_port`（BDLEPORT 扩展头）/`device_id`（UID）/`service_id`（SERVICEID）为
+/// 抖音播放列表通道的发现头：只有带这些头的 M-SEARCH 响应 + description.xml 响应，
+/// 抖音手机端才会连列表 TCP 端口（对齐 dlna_demo 增强发现）。
 pub async fn run_ssdp(
     app: AppHandle,
     socket: UdpSocket,
     uuid: &str,
     local_ip: &str,
     http_port: u16,
+    control_port: Option<u16>,
+    device_id: &str,
+    service_id: &str,
     shutdown: &mut broadcast::Receiver<()>,
 ) {
-    let _ = send_notify(&socket, uuid, local_ip, http_port).await;
+    let _ = send_notify(&socket, uuid, local_ip, http_port, control_port, device_id, service_id).await;
 
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     let mut buf = [0u8; 4096];
@@ -58,7 +64,7 @@ pub async fn run_ssdp(
         tokio::select! {
             _ = shutdown.recv() => break,
             _ = interval.tick() => {
-                let _ = send_notify(&socket, uuid, local_ip, http_port).await;
+                let _ = send_notify(&socket, uuid, local_ip, http_port, control_port, device_id, service_id).await;
             }
             res = socket.recv_from(&mut buf) => {
                 if let Ok((n, addr)) = res {
@@ -78,28 +84,30 @@ pub async fn run_ssdp(
                             "st": st,
                         }),
                     );
-                    if let Some(resp) = handle_msearch(&data, uuid, local_ip, http_port) {
+                    if let Some(responses) = handle_msearch(&data, uuid, local_ip, http_port, control_port, device_id, service_id) {
                         // 随机 0-100ms 延迟再回复，避免同网段风暴（与 TS 版一致）
                         let delay = Duration::from_millis((system_micros() % 100) as u64);
                         tokio::time::sleep(delay).await;
-                        // ① 单播响应（规范路径；但 ARP 不可达的虚拟网卡客户端收不到）
-                        let single = socket.send_to(resp.as_bytes(), addr).await;
-                        eprintln!("[dlna_ssdp] M-SEARCH respond to={addr} st={st:?} send={single:?}");
-                        // ② 响应同时发多播组（兼容层保底）：SSDP 客户端加入
-                        //    239.255.255.250:1900 组后能收到发往组的所有包（多播不依赖 ARP）。
-                        //    卓易通等安卓兼容层虚拟网卡能发多播但不响应 ARP（入站单播
-                        //    EHOSTUNREACH/Host is down）→ 单播响应永远到不了，设备搜不到。
-                        //    多播响应让客户端拿到 LOCATION 后主动 GET device-desc（出站
-                        //    由客户端发起 ARP，能通）→ 设备可被发现。
-                        let mcast = socket
-                            .send_to(resp.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT))
-                            .await;
-                        if let Err(e) = &mcast {
-                            eprintln!("[dlna_ssdp] M-SEARCH respond multicast failed: {e}");
+                        for resp in &responses {
+                            // ① 单播响应（规范路径；但 ARP 不可达的虚拟网卡客户端收不到）
+                            let single = socket.send_to(resp.as_bytes(), addr).await;
+                            eprintln!("[dlna_ssdp] M-SEARCH respond to={addr} st={st:?} send={single:?}");
+                            // ② 响应同时发多播组（兼容层保底）：SSDP 客户端加入
+                            //    239.255.255.250:1900 组后能收到发往组的所有包（多播不依赖 ARP）。
+                            //    卓易通等安卓兼容层虚拟网卡能发多播但不响应 ARP（入站单播
+                            //    EHOSTUNREACH/Host is down）→ 单播响应永远到不了，设备搜不到。
+                            //    多播响应让客户端拿到 LOCATION 后主动 GET device-desc（出站
+                            //    由客户端发起 ARP，能通）→ 设备可被发现。
+                            let mcast = socket
+                                .send_to(resp.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT))
+                                .await;
+                            if let Err(e) = &mcast {
+                                eprintln!("[dlna_ssdp] M-SEARCH respond multicast failed: {e}");
+                            }
                         }
                         // ③ 补发多播 NOTIFY alive：部分客户端只监听多播主动广播。
                         let location = format!("http://{local_ip}:{http_port}/device-desc.xml");
-                        for msg in build_notify_messages(uuid, &location) {
+                        for msg in build_notify_messages(uuid, &location, control_port, device_id, service_id) {
                             if let Err(e) = socket
                                 .send_to(msg.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT))
                                 .await
@@ -126,10 +134,13 @@ async fn send_notify(
     uuid: &str,
     local_ip: &str,
     http_port: u16,
+    control_port: Option<u16>,
+    device_id: &str,
+    service_id: &str,
 ) -> std::io::Result<()> {
     let location = format!("http://{local_ip}:{http_port}/device-desc.xml");
     for _ in 0..3 {
-        for msg in build_notify_messages(uuid, &location) {
+        for msg in build_notify_messages(uuid, &location, control_port, device_id, service_id) {
             socket
                 .send_to(msg.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT))
                 .await?;
@@ -138,7 +149,13 @@ async fn send_notify(
     Ok(())
 }
 
-fn build_notify_messages(uuid: &str, location: &str) -> Vec<String> {
+fn build_notify_messages(
+    uuid: &str,
+    location: &str,
+    control_port: Option<u16>,
+    device_id: &str,
+    service_id: &str,
+) -> Vec<String> {
     let device_type = "urn:schemas-upnp-org:device:MediaRenderer:1";
     let service_types = [
         "urn:schemas-upnp-org:service:AVTransport:1",
@@ -153,24 +170,39 @@ fn build_notify_messages(uuid: &str, location: &str) -> Vec<String> {
     for st in service_types {
         entries.push((st.into(), format!("uuid:{uuid}::{st}")));
     }
+    // ⚠️ NOTIFY 必须带抖音 SERVER 指纹 + 全套扩展头（对齐 demo sendNotify）：
+    // 抖音/乐播若走被动监听 ssdp:alive 发现设备，NOTIFY 没有能力头就不会连
+    // BDLEPORT 列表通道（降级为普通 DLNA）。普通 DLNA 客户端忽略未知头，不受影响。
+    let ext = crate::dlna::playlist::discovery_headers(control_port, device_id, service_id);
+    let ext_str: String = ext.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
     entries
         .into_iter()
-        .map(|(nt, usn)| build_notify(&nt, &usn, location))
+        .map(|(nt, usn)| build_notify(&nt, &usn, location, &ext_str))
         .collect()
 }
 
-fn build_notify(nt: &str, usn: &str, location: &str) -> String {
+fn build_notify(nt: &str, usn: &str, location: &str, ext_headers: &str) -> String {
     format!(
-        "NOTIFY * HTTP/1.1\r\nHOST: {addr}:{port}\r\nCACHE-CONTROL: max-age=1800\r\nLOCATION: {loc}\r\nSERVER: Linux/6.0 UPnP/1.1 QuickApp-DLNA/1.0\r\nNT: {nt}\r\nNTS: ssdp:alive\r\nUSN: {usn}\r\nContent-Length: 0\r\n\r\n",
+        "NOTIFY * HTTP/1.1\r\nHOST: {addr}:{port}\r\nCACHE-CONTROL: max-age=66\r\n{ext}LOCATION: {loc}\r\nSERVER: {server}\r\nNT: {nt}\r\nNTS: ssdp:alive\r\nUSN: {usn}\r\nContent-Length: 0\r\n\r\n",
         addr = SSDP_MULTICAST_ADDR,
         port = SSDP_PORT,
         loc = location,
+        server = crate::dlna::playlist::wire::DOUYIN_SERVER,
         nt = nt,
-        usn = usn
+        usn = usn,
+        ext = ext_headers
     )
 }
 
-fn handle_msearch(data: &str, uuid: &str, local_ip: &str, http_port: u16) -> Option<String> {
+fn handle_msearch(
+    data: &str,
+    uuid: &str,
+    local_ip: &str,
+    http_port: u16,
+    control_port: Option<u16>,
+    device_id: &str,
+    service_id: &str,
+) -> Option<Vec<String>> {
     let first = data.lines().next()?;
     if !first.starts_with("M-SEARCH * HTTP/1.1") {
         return None;
@@ -180,7 +212,33 @@ fn handle_msearch(data: &str, uuid: &str, local_ip: &str, http_port: u16) -> Opt
         return None;
     }
     let location = format!("http://{local_ip}:{http_port}/device-desc.xml");
-    Some(build_msearch_response(&st, uuid, &location))
+    if st == "ssdp:all" {
+        // 对齐 demo respondToSearch：ssdp:all 需逐类型回多条（每条 ST/USN 独立）。
+        // 只回一条会让严格解析的客户端认为服务清单不完整（无 AVTransport → 不可投）。
+        let targets = [
+            "upnp:rootdevice",
+            &format!("uuid:{uuid}"),
+            "urn:schemas-upnp-org:device:MediaRenderer:1",
+            "urn:schemas-upnp-org:service:AVTransport:1",
+            "urn:schemas-upnp-org:service:RenderingControl:1",
+            "urn:schemas-upnp-org:service:ConnectionManager:1",
+        ];
+        Some(
+            targets
+                .iter()
+                .map(|t| build_msearch_response(t, uuid, &location, control_port, device_id, service_id))
+                .collect(),
+        )
+    } else {
+        Some(vec![build_msearch_response(
+            &st,
+            uuid,
+            &location,
+            control_port,
+            device_id,
+            service_id,
+        )])
+    }
 }
 
 /// ST 匹配策略：已知类型 + 任意未知 ST 兜底响应（ST 回显原值）。
@@ -198,7 +256,18 @@ fn should_respond(st: &str, _uuid: &str) -> bool {
 ///  - ssdp:all / rootdevice → uuid:{uuid}::upnp:rootdevice
 ///  - uuid:{uuid}          → uuid:{uuid}
 ///  - 其它（含 DIAL/未知）  → uuid:{uuid}::{st}（回显）
-fn build_msearch_response(st: &str, uuid: &str, location: &str) -> String {
+/// ⚠️ M-SEARCH 响应带**抖音兼容指纹 SERVER** + 播放列表扩展头（BITMAP/BDLEPORT/UID/
+/// SERVICEID/X-User-Agent）：这是抖音手机端打开列表 TCP 通道的必要条件（dlna_demo
+/// 已 A/B 实测——普通 SERVER 时抖音只走 SetAVTransportURI/Play，从不连列表端口）。
+/// NOTIFY alive 同样带全套头（demo sendNotify 同款）——被动监听发现的路径也不能少。
+fn build_msearch_response(
+    st: &str,
+    uuid: &str,
+    location: &str,
+    control_port: Option<u16>,
+    device_id: &str,
+    service_id: &str,
+) -> String {
     let usn = if st == "ssdp:all" || st == "upnp:rootdevice" {
         format!("uuid:{uuid}::upnp:rootdevice")
     } else if st.starts_with("uuid:") {
@@ -206,12 +275,19 @@ fn build_msearch_response(st: &str, uuid: &str, location: &str) -> String {
     } else {
         format!("uuid:{uuid}::{st}")
     };
+    let ext = crate::dlna::playlist::discovery_headers(control_port, device_id, service_id);
+    let ext_str: String = ext
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
     format!(
-        "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nDATE: {date}\r\nEXT:\r\nLOCATION: {loc}\r\nSERVER: Linux/6.0 UPnP/1.1 QuickApp-DLNA/1.0\r\nST: {st}\r\nUSN: {usn}\r\nContent-Length: 0\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=66\r\nDATE: {date}\r\nEXT:\r\nLOCATION: {loc}\r\nSERVER: {server}\r\nST: {st}\r\nUSN: {usn}\r\n{ext}Content-Length: 0\r\n\r\n",
         date = http_date(),
         loc = location,
+        server = crate::dlna::playlist::wire::DOUYIN_SERVER,
         st = st,
-        usn = usn
+        usn = usn,
+        ext = ext_str
     )
 }
 
@@ -232,6 +308,51 @@ fn system_micros() -> u128 {
 mod tests {
     use super::*;
     use socket2::{Domain, Socket, Type};
+
+    // NOTIFY alive 必须带抖音 SERVER 指纹 + 全套扩展头（demo sendNotify 对齐）。
+    // 被动监听发现的抖音端依赖这些头决定是否连 BDLEPORT 列表通道。
+    #[test]
+    fn notify_carries_douyin_fingerprint_and_playlist_headers() {
+        let msgs = build_notify_messages("test-uuid", "http://192.168.1.2:5001/device-desc.xml", Some(45165), "12345", "svc-1");
+        assert!(!msgs.is_empty());
+        for m in &msgs {
+            assert!(m.contains(&format!("SERVER: {}", crate::dlna::playlist::wire::DOUYIN_SERVER)), "NOTIFY missing douyin SERVER: {m}");
+            assert!(m.contains("BITMAP: 0x800"), "NOTIFY missing BITMAP: {m}");
+            assert!(m.contains("BDLEPORT: 45165"), "NOTIFY missing BDLEPORT: {m}");
+            assert!(m.contains("UID: 12345"), "NOTIFY missing UID: {m}");
+            assert!(m.contains("SERVICEID: svc-1"), "NOTIFY missing SERVICEID: {m}");
+            assert!(m.contains("X-User-Agent: redsonic"), "NOTIFY missing X-User-Agent: {m}");
+        }
+    }
+
+    // ssdp:all 必须逐类型回多条（严格客户端按每条 USN 建服务清单，只回一条会判不可投）。
+    #[test]
+    fn msearch_ssdp_all_returns_one_response_per_target() {
+        let data = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n";
+        let responses = handle_msearch(data, "test-uuid", "192.168.1.2", 5001, Some(45165), "12345", "svc-1").unwrap();
+        assert_eq!(responses.len(), 6);
+        for r in &responses {
+            assert!(r.contains("BITMAP: 0x800"));
+            assert!(r.contains("BDLEPORT: 45165"));
+        }
+        let sts: Vec<&str> = responses.iter().filter_map(|r| {
+            r.lines().find(|l| l.starts_with("ST: ")).map(|l| l.trim_start_matches("ST: "))
+        }).collect();
+        assert!(sts.contains(&"upnp:rootdevice"));
+        assert!(sts.contains(&"uuid:test-uuid"));
+        assert!(sts.contains(&"urn:schemas-upnp-org:device:MediaRenderer:1"));
+        assert!(sts.contains(&"urn:schemas-upnp-org:service:AVTransport:1"));
+    }
+
+    // 单一 ST 查询仍回单条（回显 ST）。
+    #[test]
+    fn msearch_single_st_returns_single_response() {
+        let data = "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
+        let responses = handle_msearch(data, "test-uuid", "192.168.1.2", 5001, Some(45165), "12345", "svc-1").unwrap();
+        assert_eq!(responses.len(), 1);
+        assert!(responses[0].contains("ST: urn:schemas-upnp-org:device:MediaRenderer:1"));
+        assert!(responses[0].contains("USN: uuid:test-uuid::urn:schemas-upnp-org:device:MediaRenderer:1"));
+    }
 
     // 验证 socket2 路径走得通（高位端口避开沙箱 / CI 的 1900 占用）。
     // 单次 bind 必须成功；double-bind 在标准 Linux 上即便有 SO_REUSEADDR 也会

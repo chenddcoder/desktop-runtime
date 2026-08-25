@@ -38,6 +38,12 @@ pub struct AvTransport {
     /// 上次 GetPositionInfo 返回给客户端的 RelTime（毫秒），用于判断客户端
     /// 是否已确认在播。换源（SetAVTransportURI）时清零。
     last_reported: Mutex<u64>,
+    /// 抖音播放列表通道模式：列表建立（通道 Play/AddDramaList）后置 true。
+    /// 此模式下连播由接收端 auto_next + PushMediaInfo 管理，GetPositionInfo
+    /// 必须**如实报告**进度——任何伪装（fake_short 的 6000/7000、force_complete
+    /// 的 dur+1000）都会让客户端自己也判定"播完"并发起第二路切集，与本地切集
+    /// 竞态（实测导致抖音退出）。普通 SOAP SetAVTransportURI 到来时清除。
+    playlist_mode: Mutex<bool>,
 }
 
 #[allow(dead_code)]
@@ -52,6 +58,7 @@ impl AvTransport {
             force_complete: Mutex::new(false),
             force_complete_at: Mutex::new(None),
             last_reported: Mutex::new(0),
+            playlist_mode: Mutex::new(false),
         }
     }
 
@@ -174,8 +181,16 @@ impl AvTransport {
     }
 
     /// 记录本次 GetPositionInfo 返回给客户端的 RelTime（毫秒）。
-    pub fn set_last_reported(&self, ms: u64) {
-        *self.last_reported.lock().unwrap() = ms;
+    /// 列表通道模式开关（见字段注释）。
+    pub fn set_playlist_mode(&self, on: bool) {
+        *self.playlist_mode.lock().unwrap() = on;
+    }
+
+    pub fn playlist_mode(&self) -> bool {
+        *self.playlist_mode.lock().unwrap()
+    }
+
+    pub fn set_last_reported(&self, ms: u64) {        *self.last_reported.lock().unwrap() = ms;
     }
 
     /// 上次 GetPositionInfo 返回给客户端的 RelTime（毫秒）。

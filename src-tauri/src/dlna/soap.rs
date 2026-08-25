@@ -175,6 +175,10 @@ pub fn handle_action(action: &str, params: &HashMap<String, String>, av: &AvTran
                     meta.chars().take(120).collect::<String>()
                 );
                 av.set_uri(&decode_html_entities(uri), &meta);
+                // addOn 边界：普通 DLNA 投屏（SetAVTransportURI 路径）**永不进列表模式**，
+                // 显式复位——防止先投过抖音列表（playlist_mode=true）再普通投屏非抖音
+                // 视频时残留列表模式，导致公版也走"如实报告"（污染公版伪装链路）。
+                av.set_playlist_mode(false);
             }
             ActionOutcome::StateChanged
         }
@@ -251,21 +255,18 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             //   - 按下切集（force_complete）：进度返回 7s
             //   - 没有按下（自然播完）：真实进度到达真实末尾（前端已上报
             //     pos>=真实时长）→ 进度同样返回 7s
-            let is_douyin_source = [
-                "douyinvod.com",
-                "douyincdn.com",
-                "iesdouyin.com",
-                "bytecdn.cn",
-                "pstatp.com",
-                "byteimg.com",
-                "toutiaoimg.com",
-                "toutiaovod.com",
-                "ixigua.com",
-            ]
-            .iter()
-            .any(|suffix| uri.contains(suffix))
-                || uri.contains("ott_cast");
-            let fake_short = is_douyin_source && dur > 0 && dur < 6000;
+            // addOn 激活判据统一收敛到 playlist::is_douyin_url（9 域名 + ott_cast），
+            // 与列表模式激活（mod.rs on_play_request）共用同一规则，避免两份漂移。
+            let is_douyin_source = crate::dlna::playlist::is_douyin_url(&uri);
+            // ⚠️ 列表通道模式（抖音 BDLE 播放列表已建立）：**必须如实报告真实进度**，
+            // 禁用下方全部伪装（fake_short / force_complete）。原因：切集由服务端主导
+            // （前端上报 pos>=dur → auto_next 本地切集 + PushMediaInfo 同步手机），若
+            // SOAP 层继续伪装"播完超时"，抖音客户端自己也会判定播完发起第二路切集
+            // （Stop→SetAVTransportURI→Play），与服务端切集形成**双路竞态**——实测
+            // 表现为"切下一个后抖音退出投屏"。列表模式下客户端只消费 PushMediaInfo
+            // 播单更新，不再靠 GetPositionInfo 播完信号切集。
+            let playlist_mode = av.playlist_mode();
+            let fake_short = !playlist_mode && is_douyin_source && dur > 0 && dur < 6000;
             let reported_dur = if fake_short { 6000 } else { dur };
             if fake_short {
                 // 超时兜底：客户端一直不切集时清除 force_complete，防止锁死
@@ -280,7 +281,7 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
                     pos = reported_dur + FORCE_COMPLETE_OVERSHOOT_MS;
                 }
                 // 其余情况（播放中）：保留真实进度（<6s）
-            } else if av.force_complete() && dur > 0 {
+            } else if !playlist_mode && av.force_complete() && dur > 0 {
                 // 强制完成逻辑（TV 下键/手动切集，前端发 force_complete 信号）：
                 // **与安卓端完全对齐——瞬间跳变到超出总时长**（RelTime = dur + OVERSHOOT）。
                 // 安卓抖音实测：position=dur+1000 必切集（历史实证）。iOS 抖音按下后
@@ -324,7 +325,7 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             // 之前用 ms_to_hms 打印带小数，日志看着"没生效"但 XML 已是整秒——
             // 判断是否生效以本日志为准。
             eprintln!(
-                "[dlna_soap_resp] GetPositionInfo -> RelTime={rel_time} TrackDuration={} (pos={pos}ms realDur={dur}ms fake_short={fake_short} is_douyin={is_douyin_source} force_complete={}) TrackURI={uri:?} TrackMetaData.len={}",
+                "[dlna_soap_resp] GetPositionInfo -> RelTime={rel_time} TrackDuration={} (pos={pos}ms realDur={dur}ms fake_short={fake_short} is_douyin={is_douyin_source} force_complete={} playlist_mode={playlist_mode}) TrackURI={uri:?} TrackMetaData.len={}",
                 ms_to_hms_whole(reported_dur),
                 av.force_complete(),
                 meta.len()
@@ -567,6 +568,48 @@ mod tests {
         // 换集（SetAVTransportURI）清标志
         av.set_uri("http://x/v2.mp4", "");
         assert!(!av.force_complete());
+    }
+
+    /// 列表通道模式（抖音 BDLE 播放列表已建立）下 GetPositionInfo 必须**如实报告**：
+    /// fake_short / force_complete 伪装全部禁用——否则客户端自己也判定"播完"发起
+    /// 第二路切集（Stop→SetAVTransportURI→Play），与服务端 auto_next 形成双路竞态
+    /// （实测表现：切下一个后抖音退出投屏）。列表模式下客户端只消费 PushMediaInfo
+    /// 播单更新，不再依赖 GetPositionInfo 播完信号切集。
+    #[test]
+    fn playlist_mode_reports_real_progress() {
+        let av = crate::dlna::av_transport::AvTransport::new();
+        // 抖音短视频源（<6s）+ 列表模式 → fake_short 必须失效，如实报 5s
+        av.set_uri("http://v.douyinvod.com/x/short.mp4", "");
+        av.update_duration(5_000);
+        av.update_position(4_500);
+        av.set_playlist_mode(true);
+        let m = response_params("GetPositionInfo", &av);
+        assert_eq!(
+            m.get("TrackDuration").map(|s| s.as_str()),
+            Some("00:00:05"),
+            "列表模式下 TrackDuration 必须如实（不得伪装 6s）"
+        );
+        assert_eq!(
+            m.get("RelTime").map(|s| s.as_str()),
+            Some("00:00:04.500"),
+            "列表模式播放中如实报告真实进度"
+        );
+        // 列表模式 + force_complete 信号 → 必须失效，不得返回 dur+OVERSHOOT
+        av.set_force_complete();
+        let m = response_params("GetPositionInfo", &av);
+        assert_eq!(
+            m.get("RelTime").map(|s| s.as_str()),
+            Some("00:00:04.500"),
+            "列表模式下 force_complete 伪装必须禁用"
+        );
+        // 退出列表模式 → 恢复伪装链路（短视频 fake_short 恢复 6s）
+        av.set_playlist_mode(false);
+        let m = response_params("GetPositionInfo", &av);
+        assert_eq!(
+            m.get("TrackDuration").map(|s| s.as_str()),
+            Some("00:00:06"),
+            "退出列表模式后 fake_short 伪装恢复"
+        );
     }
 
     /// 强制完成：客户端已确认在播（上次回报 ≥1s）→ **瞬间跳变**到超出总时长的

@@ -244,17 +244,18 @@
     }
   }
 
-  // 投屏请求 → ACTION_DLNA playerUrl（与 sendNativeEvent 同格式，对象形态）
-  function broadcastPlay(url) {
+  // 投屏请求 → ACTION_DLNA playerUrl（与 sendNativeEvent 同格式，对象形态）。
+  // title 可选：普通投屏 Rust 不带；播放列表切集时带（esapp-tvcast casting 页用于更新标题）。
+  function broadcastPlay(url, title) {
     if (!url) return false;
-    var payload = { actionType: 'playerUrl', url: url, title: '' };
+    var payload = { actionType: 'playerUrl', url: url, title: title || '' };
     if (broadcastToApp('ACTION_DLNA', payload)) {
       reportDlnaState('forward-play', { ok: true, url: url });
       pendingDlnaPlay = null;
       return true;
     }
     // 快应用 EventDispatcher 尚未就绪：缓存（覆盖旧的），轮询/就绪后补发
-    pendingDlnaPlay = { url: url };
+    pendingDlnaPlay = { url: url, title: payload.title };
     dlog('warn', '快应用未就绪，缓存投屏请求待补发', { url: url });
     reportDlnaState('forward-play', { ok: false, url: url, cached: true });
     return false;
@@ -271,7 +272,7 @@
     if (pendingDlnaPlay) {
       var p = pendingDlnaPlay;
       pendingDlnaPlay = null;
-      if (!broadcastPlay(p.url)) {
+      if (!broadcastPlay(p.url, p.title)) {
         pendingDlnaPlay = p; // 仍不可用，退回缓存
       }
     }
@@ -290,7 +291,7 @@
       if (pendingDlnaPlay) {
         var p = pendingDlnaPlay;
         pendingDlnaPlay = null;
-        broadcastPlay(p.url);
+        broadcastPlay(p.url, p.title);
       }
     });
   }
@@ -303,9 +304,9 @@
     window.__TAURI__.event.listen('dlna://play', function (e) {
       var url = e && e.payload && e.payload.url;
       if (url) {
-        dlog('cast-play', '收到投屏请求（转发快应用）', { url: url });
+        dlog('cast-play', '收到投屏请求（转发快应用）', { url: url, title: e.payload.title });
         reportDlnaState('received-play', { url: url });
-        broadcastPlay(url);
+        broadcastPlay(url, e.payload.title);
       }
     });
     window.__TAURI__.event.listen('dlna://status', function (e) {

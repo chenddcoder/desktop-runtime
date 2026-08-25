@@ -20,6 +20,9 @@ pub async fn run_http(
     port: u16,
     desc: Arc<DeviceDesc>,
     av: Arc<AvTransport>,
+    control_port: Option<u16>,
+    device_id: &str,
+    service_id: &str,
     shutdown: &mut broadcast::Receiver<()>,
 ) -> std::io::Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", port)).await?;
@@ -32,8 +35,10 @@ pub async fn run_http(
                         let app = app.clone();
                         let desc = desc.clone();
                         let av = av.clone();
+                        let device_id = device_id.to_string();
+                        let service_id = service_id.to_string();
                         tokio::spawn(async move {
-                            let _ = handle_conn(stream, app, desc, av, peer).await;
+                            let _ = handle_conn(stream, app, desc, av, peer, control_port, &device_id, &service_id).await;
                         });
                     }
                     Err(_) => break,
@@ -72,6 +77,9 @@ async fn handle_conn(
     desc: Arc<DeviceDesc>,
     av: Arc<AvTransport>,
     peer: std::net::SocketAddr,
+    control_port: Option<u16>,
+    device_id: &str,
+    service_id: &str,
 ) -> std::io::Result<()> {
     // 跨请求读缓冲：支持 keep-alive（同一连接多个请求，Android OkHttp 连接池必需）。
     // 之前实现只 read 一次 + Connection: close：TCP 不保证一次 read 拿到完整请求，
@@ -160,10 +168,21 @@ async fn handle_conn(
         if method == "GET" || method == "HEAD" {
             match desc.handle(&path) {
                 Some((b, ct)) => {
-                    write_response(&mut stream, 200, &ct, &b, conn_keep_alive).await?
+                    // ⚠️ device-desc.xml 响应重复附加抖音播放列表扩展头（对齐 dlna_demo）：
+                    // 无论手机在 SSDP 结果阶段还是读设备 XML 阶段做能力判断，都能看到一致数据。
+                    // 抖音指纹 SERVER 只用于描述文档响应；scpd 等普通路径保持标准 DLNA SERVER。
+                    let (server, extra) = if path == "/device-desc.xml" {
+                        (
+                            crate::dlna::playlist::wire::DOUYIN_SERVER,
+                            crate::dlna::playlist::discovery_headers(control_port, device_id, service_id),
+                        )
+                    } else {
+                        (crate::dlna::playlist::wire::STD_SERVER, Vec::new())
+                    };
+                    write_response(&mut stream, 200, &ct, &b, conn_keep_alive, server, &extra).await?
                 }
                 None => {
-                    write_response(&mut stream, 404, "text/plain", "Not found", conn_keep_alive).await?
+                    write_response(&mut stream, 404, "text/plain", "Not found", conn_keep_alive, crate::dlna::playlist::wire::STD_SERVER, &[]).await?
                 }
             }
         } else if method == "POST" {
@@ -209,12 +228,12 @@ async fn handle_conn(
                         }
                         _ => {}
                     }
-                    write_response(&mut stream, 200, "text/xml; charset=\"utf-8\"", &xml, conn_keep_alive)
+                    write_response(&mut stream, 200, "text/xml; charset=\"utf-8\"", &xml, conn_keep_alive, crate::dlna::playlist::wire::STD_SERVER, &[])
                         .await?;
                 }
                 None => {
                     let err = soap::build_soap_error(401, "Invalid SOAP request");
-                    write_response(&mut stream, 500, "text/xml; charset=\"utf-8\"", &err, conn_keep_alive)
+                    write_response(&mut stream, 500, "text/xml; charset=\"utf-8\"", &err, conn_keep_alive, crate::dlna::playlist::wire::STD_SERVER, &[])
                         .await?;
                 }
             }
@@ -230,7 +249,8 @@ async fn handle_conn(
                 .collect::<Vec<_>>()
                 .join(" | ");
             eprintln!("[dlna_http_req] method={method} path={path} from={peer} head=[{brief}]");
-            write_response(&mut stream, 501, "text/plain", "Not implemented", conn_keep_alive).await?;
+            write_response(&mut stream, 501, "text/plain", "Not implemented", conn_keep_alive, crate::dlna::playlist::wire::STD_SERVER, &[])
+                .await?;
         }
 
         // ---- 4. keep-alive：继续处理同一连接的下一个请求；close 则结束 ----
@@ -246,6 +266,8 @@ async fn write_response(
     content_type: &str,
     body: &str,
     keep_alive: bool,
+    server: &str,
+    extra_headers: &[(String, String)],
 ) -> std::io::Result<()> {
     let status_text = match status {
         200 => "OK",
@@ -262,12 +284,18 @@ async fn write_response(
     // Connection 头跟随客户端：keep-alive 复用连接（Android OkHttp 连接池），close 关闭。
     let date = chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
     let conn = if keep_alive { "keep-alive" } else { "close" };
+    let extra: String = extra_headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
     let header = format!(
-        "HTTP/1.1 {status} {text}\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\nDate: {date}\r\nEXT:\r\nServer: Linux/6.0 UPnP/1.1 QuickApp-DLNA/1.0\r\nConnection: {conn}\r\n\r\n",
+        "HTTP/1.1 {status} {text}\r\nContent-Type: {ct}\r\nContent-Length: {len}\r\nDate: {date}\r\nEXT:\r\nServer: {server}\r\n{extra}Connection: {conn}\r\n\r\n",
         status = status,
         text = status_text,
         ct = content_type,
-        len = body.len()
+        len = body.len(),
+        server = server,
+        extra = extra
     );
     stream.write_all(header.as_bytes()).await?;
     stream.write_all(body.as_bytes()).await?;
