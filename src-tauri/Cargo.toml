@@ -15,9 +15,13 @@ tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
 regex = "1"
+# 抖音播放列表通道加密会话（对齐 dlna_demo SessionCrypto：X25519 协商 + AES-128-GCM）
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 futures-util = "0.3"
 base64 = "0.22"
