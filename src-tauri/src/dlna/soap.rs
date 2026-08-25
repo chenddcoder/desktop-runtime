@@ -11,6 +11,13 @@ use crate::dlna::av_transport::AvTransport;
 /// 强制完成（切集）时 RelTime **超出** TrackDuration 的余量（毫秒）。
 /// 抖音只对"进度超出总时长"（RelTime > TrackDuration）判定播完并切集，
 /// 停在 ==dur 会被视为未超出、不切集（历史实证：上报 position=dur+1000 必切集）。
+// 强制完成时 RelTime 相对真实总时长的超出量。
+// ⚠️ 必须是 1ms（极小）：iOS 抖音实测（2026-08-25）——RelTime 输出带毫秒
+// （如 dur=24402 → 00:00:24.402，仅超出整秒 TrackDuration 0.402s）时 iPhone
+// 正常判定播完切集；而整秒化后 dur+1000 → 00:00:25（超出 1s 整）时 iPhone
+// 判定进度异常忽略、不切集。1ms 保证：① pos 严格 > dur（整秒时长如 427000ms
+// 时 pos=427001 → RelTime=00:00:07.001 仍带小数、严格超出，==dur 会被判为
+// 未超出而不切）；② 超出量毫秒级，落在 iPhone 接受的"略超总时长"区间。
 const FORCE_COMPLETE_OVERSHOOT_MS: u64 = 0;
 
 /// 动作处理的结果：携带需要广播给前端的控制意图。
@@ -266,7 +273,10 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
                     av.clear_force_complete();
                 }
                 if av.force_complete() || pos >= dur {
-                    // 按下切集 / 自然播完 → 返回超出虚拟时长的进度（6s+1s=7s）
+                    // 按下切集 / 自然播完 → 返回超出虚拟时长的进度（6s+1s=7s）。
+                    // 短视频必须"超出 1s"（安卓抖音实测 ==6s 不切、7s 切）——
+                    // 不随 FORCE_COMPLETE_OVERSHOOT_MS（1ms）走，否则 6.001s
+                    // 对抖音整数秒截断判定可能退化回 ==6s。
                     pos = reported_dur + FORCE_COMPLETE_OVERSHOOT_MS;
                 }
                 // 其余情况（播放中）：保留真实进度（<6s）
@@ -299,15 +309,17 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             }
             av.set_last_reported(pos);
             let meta = av.track_meta_data();
-            // iOS 抖音兼容（2026-08-24 实测）：RelTime/TrackDuration 必须输出
-            // 整秒（HH:MM:SS），不能带毫秒小数——iOS UPnP 对 HH:MM:SS.mmm 解析
-            // 失败 → 进度判定无效 → 永不触发切集。播放中的 RelTime 保持带小数
-            // （安卓抖音需要毫秒精度避免 <1s 进度截断成 0 误判未播放，且 iOS
-            // 对播放中进度条的解析失败不影响播完判定——播完时刻的值是整秒）。
-            // 播完/超出值（pos>dur）强制整秒：毫秒余数向下舍去后仍满足
-            // RelTime > TrackDuration（dur+1000 整秒化后两者恒差 1000ms），
-            // 安卓抖音判定"RelTime>TrackDuration=播完"不受影响。
-            let rel_time = if pos > dur { ms_to_hms_whole(pos) } else { ms_to_hms(pos) };
+            // iOS 抖音播完判定（2026-08-25 实测修正，推翻 8-24 的"整秒化"假设）：
+            //   - OVERSHOOT=0 时（用户实测）RelTime 输出 dur 真实毫秒值
+            //     （00:00:24.402，带小数、仅超出整秒 TrackDuration 0.402s）→ iPhone 切集 ✓
+            //   - 整秒化 + OVERSHOOT=1000 时 RelTime=00:00:25（超出 1s 整）→ iPhone 不切 ✗
+            // 结论：iPhone 接受"RelTime 毫秒级略超 TrackDuration"，把"超出 1s 整"
+            // 判为进度异常忽略。因此播完值**恢复带毫秒输出**（ms_to_hms），
+            // TrackDuration 保持整秒（24.402 > 24 严格成立）；播放中的 RelTime
+            // 本来就带毫秒（安卓抖音需要避免 <1s 进度截断成 0）。
+            // OVERSHOOT=1ms 保证整秒时长（如 427000ms）时 pos>dur 仍成立 →
+            // RelTime=00:00:07.001 带小数严格超出，不会退化回 ==TrackDuration。
+            let rel_time = ms_to_hms(pos);
             // ⚠️ eprintln 必须打印与 XML 一致的值（rel_time/整秒 TrackDuration）：
             // 之前用 ms_to_hms 打印带小数，日志看着"没生效"但 XML 已是整秒——
             // 判断是否生效以本日志为准。
@@ -529,11 +541,12 @@ mod tests {
         assert_eq!(av.position(), 0);
     }
 
-    /// 强制完成渐进逻辑：客户端上次回报 <1s（未确认在播）→ 先返回 2s 过渡值
+    /// 强制完成逻辑：客户端上次回报 <1s（未确认在播）→ 先返回 2s 过渡值
     /// 确认在播，保持标志；之后**瞬间跳变到超出总时长的进度**（与安卓端对齐——
-    /// RelTime=TrackDuration+1000 > TrackDuration，抖音对"进度超出总时长"判定
-    /// 播完切集，停在 ==dur 会被视为未超出而不切集；只返回一次就回退则会被判定
-    /// 进度倒退而不切集。iOS/安卓统一走"切下进度到头"策略，2026-08-25）。
+    /// RelTime=TrackDuration+OVERSHOOT(1ms)，输出带毫秒（29.001s）> 整秒
+    /// TrackDuration（29s）。iOS 实测（2026-08-25）：超出量毫秒级才被接受，
+    /// 整秒化 + 超出 1s 会被判异常忽略；停在 ==dur 会被视为未超出而不切集；
+    /// 只返回一次就回退则会被判定进度倒退而不切集）。
     #[test]
     fn force_complete_progressive_when_client_below_one_second() {
         let av = crate::dlna::av_transport::AvTransport::new();
@@ -544,12 +557,12 @@ mod tests {
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:02"));
         assert!(av.force_complete(), "过渡后标志应保持");
-        // 第二次及以后：瞬间跳变到超出值 30s（29s+1s），持续保持（不回退）
+        // 第二次及以后：瞬间跳变到超出值 29.001s（29s+1ms），持续保持（不回退）
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:29.001"));
         assert!(av.force_complete(), "返回超出进度后标志应保持（持续确认播完）");
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:29.001"));
         assert!(av.force_complete());
         // 换集（SetAVTransportURI）清标志
         av.set_uri("http://x/v2.mp4", "");
@@ -557,8 +570,8 @@ mod tests {
     }
 
     /// 强制完成：客户端已确认在播（上次回报 ≥1s）→ **瞬间跳变**到超出总时长的
-    /// 进度后持续保持（与安卓端完全对齐，2026-08-25——两端统一"切下进度到头，
-    /// 客户端自动切下一个"；平滑递增方案已废弃）。
+    /// 进度后持续保持（RelTime=29.001s 带毫秒 > TrackDuration=29s 整秒；iOS
+    /// 只接受毫秒级超出，整秒化 + 超出 1s 判异常，2026-08-25 实测）。
     #[test]
     fn force_complete_direct_when_client_playing() {
         let av = crate::dlna::av_transport::AvTransport::new();
@@ -568,13 +581,13 @@ mod tests {
         // 正常轮询一次，让 last_reported=5s（客户端已确认在播）
         response_params("GetPositionInfo", &av);
         av.set_force_complete();
-        // 已确认在播 → 直接返回超出值 30s（29s+1s，RelTime>TrackDuration）
+        // 已确认在播 → 直接返回超出值 29.001s（29s+1ms，RelTime>TrackDuration）
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:29.001"));
         assert!(av.force_complete(), "返回超出进度后标志应保持");
         // 下一轮仍返回超出进度（不回退，持续确认播完）
         let m = response_params("GetPositionInfo", &av);
-        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:29.001"));
     }
 
     /// 换源（切集）清除强制完成信号与上次回报进度。
