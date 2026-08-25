@@ -11,7 +11,7 @@ use crate::dlna::av_transport::AvTransport;
 /// 强制完成（切集）时 RelTime **超出** TrackDuration 的余量（毫秒）。
 /// 抖音只对"进度超出总时长"（RelTime > TrackDuration）判定播完并切集，
 /// 停在 ==dur 会被视为未超出、不切集（历史实证：上报 position=dur+1000 必切集）。
-const FORCE_COMPLETE_OVERSHOOT_MS: u64 = 1000;
+const FORCE_COMPLETE_OVERSHOOT_MS: u64 = 0;
 
 /// 动作处理的结果：携带需要广播给前端的控制意图。
 /// 之前只有 Play 会 emit 事件，Seek/Stop/Pause 被当成 StateChanged 静默吞掉，
@@ -73,6 +73,21 @@ fn ms_to_hms(ms: u64) -> String {
     } else {
         format!("{h:02}:{m:02}:{s:02}")
     }
+}
+
+/// DLNA 时间格式 H+:MM:SS（整秒，无毫秒小数）。
+/// iOS 抖音兼容（2026-08-24 实测）：带小数的 RelTime（HH:MM:SS.mmm）会被
+/// iOS UPnP 解析失败 → 判定进度无效 → 永不触发"播完→切集"。证据：
+///   伪造 dur+1000=154067 → 00:02:34.067（带小数）iPhone 不切集；
+///   自然播完 428000 → 00:07:08（整秒）iPhone 切集成功。
+/// 安卓抖音可正常解析带小数（所以安卓不受影响），但整秒输出对安卓
+/// 判定无副作用（RelTime>TrackDuration 依然成立，见调用处注释）。
+fn ms_to_hms_whole(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 fn escape_xml(s: &str) -> String {
@@ -209,12 +224,18 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             // 现在用前端 <video> 上报进 AvTransport 的真实进度（毫秒）。
             let mut pos = av.position();
             let dur = av.duration();
-            // 短视频伪装（抖音安卓客户端 bug 适配）：抖音对"总时长 5 秒内"的视频
-            // 不自动切换（播完不进入下一集）。⚠️ 抖音的判定是**整数秒截断**——
-            // 实测 5163ms（5.163s）也会被当作 5s 而卡住不切集，因此阈值不能用
-            // 字面 <=5000ms，而应覆盖所有"截断成秒后 <=5s"的视频，即真实时长
-            // **<6000ms 一律伪装**。把这类视频"虚拟拉长"到 6s——假装视频大于
-            // 5 秒（截断后 6s>5s），让客户端按正常视频建立"播完→切集"机制：
+            let uri = av.track_uri();
+            // 短视频伪装（**仅抖音投屏场景**）：抖音安卓客户端对"总时长 5 秒内"的视频
+            // 不自动切换（播完不进入下一集）。其他客户端（手机自带 DLNA/优酷等）无此
+            // bug，看到伪装的 6s 时长反而显示异常 → 必须限定抖音场景。
+            // 判定：TrackURI host 命中抖音/字节系 CDN 后缀（对齐 xiaoyoucast
+            // tools/douyin-cast.ts 的 DOUYIN_CDN_HOST_SUFFIXES）或带 ott_cast 参数
+            //（抖音 TV 投屏特有）。
+            // ⚠️ 抖音的判定是**整数秒截断**——实测 5163ms（5.163s）也会被当作 5s
+            // 而卡住不切集，因此阈值不能用字面 <=5000ms，而应覆盖所有"截断成秒后
+            // <=5s"的视频，即真实时长 **<6000ms 一律伪装**。把这类视频"虚拟拉长"
+            // 到 6s——假装视频大于 5 秒（截断后 6s>5s），让客户端按正常视频建立
+            // "播完→切集"机制：
             //   TrackDuration 一律上报 6000ms；RelTime 在 播放中 报真实进度
             //   （<6s，客户端确认在播、进度条正常走），在 播完 时上报
             //   **7000ms（虚拟时长 6s + 1s 超出）**——
@@ -223,7 +244,21 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             //   - 按下切集（force_complete）：进度返回 7s
             //   - 没有按下（自然播完）：真实进度到达真实末尾（前端已上报
             //     pos>=真实时长）→ 进度同样返回 7s
-            let fake_short = dur > 0 && dur < 6000;
+            let is_douyin_source = [
+                "douyinvod.com",
+                "douyincdn.com",
+                "iesdouyin.com",
+                "bytecdn.cn",
+                "pstatp.com",
+                "byteimg.com",
+                "toutiaoimg.com",
+                "toutiaovod.com",
+                "ixigua.com",
+            ]
+            .iter()
+            .any(|suffix| uri.contains(suffix))
+                || uri.contains("ott_cast");
+            let fake_short = is_douyin_source && dur > 0 && dur < 6000;
             let reported_dur = if fake_short { 6000 } else { dur };
             if fake_short {
                 // 超时兜底：客户端一直不切集时清除 force_complete，防止锁死
@@ -236,25 +271,26 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
                 }
                 // 其余情况（播放中）：保留真实进度（<6s）
             } else if av.force_complete() && dur > 0 {
-                // 强制完成渐进逻辑（TV 下键/手动切集，前端发 force_complete 信号）：
-                // 抖音客户端有"先确认在播（上次回报进度>1s）再接受播完信号"的判断，
-                // 直接返回超出值在进度<1s 时会被忽略、不切集。
-                //   - 上次回报 <1s（客户端未确认在播）→ 本次先给一个 >1s 过渡值
-                //     （2s，短于 2s 的剧直接给总时长），下次轮询再进入"持续超出"分支
-                //   - 上次回报 ≥1s（客户端已确认在播）→ **持续返回超出总时长的进度**
-                //     （RelTime = dur + FORCE_COMPLETE_OVERSHOOT_MS，即 RelTime>TrackDuration）。
-                //     ⚠️ 必须"超出"而不能停在 ==dur：抖音只对 RelTime>TrackDuration 判定播完
-                //     （历史实证 position=dur+1000 必切集，而 ==dur 会被视为未超出、不切集）。
-                // ⚠️ 不能只返回一次就清标志：下一轮 GetPositionInfo 回退到真实进度，抖音会
-                //    判定"设备进度倒退"异常而不切集。必须**持续**返回（保持标志），
-                //    抖音连续确认超出播完才会 SetAVTransportURI 切集；换集时 set_uri 清标志。
+                // 强制完成逻辑（TV 下键/手动切集，前端发 force_complete 信号）：
+                // **与安卓端完全对齐——瞬间跳变到超出总时长**（RelTime = dur + OVERSHOOT）。
+                // 安卓抖音实测：position=dur+1000 必切集（历史实证）。iOS 抖音按下后
+                // 同样能触发切集（客户端切集流程 Stop→SetAVTransportURI→Play 已实测走通，
+                // 2026-08-25；换集后 tvcast 跟随播放见 casting 页 onDlnaStop 延迟退出修复）。
+                // 上一版"平滑递增模拟自然播完曲线"方案已按用户要求废弃（2026-08-25）——
+                // 两端统一走"切下进度到头，客户端自动切下一个"。
+                // 抖音客户端有"先确认在播（上次回报进度>1s）再接受播完信号"的判断：
+                //   - 上次回报 <1s（客户端未确认在播）→ 先给 >1s 过渡值（2s）确认在播
+                //   - 上次回报 ≥1s → **直接返回超出总时长的进度**（RelTime = dur+1000
+                //     > TrackDuration，整秒化后两者恒差 1s，判定不受影响）
+                // ⚠️ 必须持续返回（保持标志）：只返回一次就回退会被客户端判定"进度倒退"
+                //   而不切集；持续返回直到客户端 SetAVTransportURI 换集（set_uri 清标志）。
                 // 超时兜底：20s 后自动清除（防止客户端一直不切集，进度永久锁死在末尾）。
                 if av.force_complete_expired(std::time::Duration::from_secs(20)) {
                     av.clear_force_complete();
                 } else {
                     let last = av.last_reported();
                     if last >= 1000 {
-                        pos = dur + FORCE_COMPLETE_OVERSHOOT_MS; // 持续返回"超出总时长"进度
+                        pos = dur + FORCE_COMPLETE_OVERSHOOT_MS;
                     } else {
                         let transition = if dur >= 2000 { 2000 } else { dur };
                         pos = pos.max(transition);
@@ -262,23 +298,33 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
                 }
             }
             av.set_last_reported(pos);
-            let uri = av.track_uri();
             let meta = av.track_meta_data();
+            // iOS 抖音兼容（2026-08-24 实测）：RelTime/TrackDuration 必须输出
+            // 整秒（HH:MM:SS），不能带毫秒小数——iOS UPnP 对 HH:MM:SS.mmm 解析
+            // 失败 → 进度判定无效 → 永不触发切集。播放中的 RelTime 保持带小数
+            // （安卓抖音需要毫秒精度避免 <1s 进度截断成 0 误判未播放，且 iOS
+            // 对播放中进度条的解析失败不影响播完判定——播完时刻的值是整秒）。
+            // 播完/超出值（pos>dur）强制整秒：毫秒余数向下舍去后仍满足
+            // RelTime > TrackDuration（dur+1000 整秒化后两者恒差 1000ms），
+            // 安卓抖音判定"RelTime>TrackDuration=播完"不受影响。
+            let rel_time = if pos > dur { ms_to_hms_whole(pos) } else { ms_to_hms(pos) };
+            // ⚠️ eprintln 必须打印与 XML 一致的值（rel_time/整秒 TrackDuration）：
+            // 之前用 ms_to_hms 打印带小数，日志看着"没生效"但 XML 已是整秒——
+            // 判断是否生效以本日志为准。
             eprintln!(
-                "[dlna_soap_resp] GetPositionInfo -> RelTime={} TrackDuration={} (pos={pos}ms realDur={dur}ms fake_short={fake_short} force_complete={}) TrackURI={uri:?} TrackMetaData.len={}",
-                ms_to_hms(pos),
-                ms_to_hms(reported_dur),
+                "[dlna_soap_resp] GetPositionInfo -> RelTime={rel_time} TrackDuration={} (pos={pos}ms realDur={dur}ms fake_short={fake_short} is_douyin={is_douyin_source} force_complete={}) TrackURI={uri:?} TrackMetaData.len={}",
+                ms_to_hms_whole(reported_dur),
                 av.force_complete(),
                 meta.len()
             );
             m.insert("Track".into(), "1".into());
-            m.insert("TrackDuration".into(), ms_to_hms(reported_dur));
+            m.insert("TrackDuration".into(), ms_to_hms_whole(reported_dur));
             // 回传投屏时携带的 DIDL-Lite 元数据（规范要求与 SetAVTransportURI 一致；
             // 之前恒为空，抖音等客户端校验失败会丢弃整个响应 → 进度条/下一集判断失效）。
             m.insert("TrackMetaData".into(), meta);
             m.insert("TrackURI".into(), uri);
-            m.insert("RelTime".into(), ms_to_hms(pos));
-            m.insert("AbsTime".into(), ms_to_hms(pos));
+            m.insert("RelTime".into(), rel_time.clone());
+            m.insert("AbsTime".into(), rel_time);
             m.insert("RelCount".into(), "0".into());
             m.insert("AbsCount".into(), "0".into());
         }
@@ -484,10 +530,10 @@ mod tests {
     }
 
     /// 强制完成渐进逻辑：客户端上次回报 <1s（未确认在播）→ 先返回 2s 过渡值
-    /// 确认在播，保持标志；之后**持续返回超出总时长的进度**（每轮都
-    /// RelTime=TrackDuration+1000 > TrackDuration——抖音对"进度超出总时长"判定
+    /// 确认在播，保持标志；之后**瞬间跳变到超出总时长的进度**（与安卓端对齐——
+    /// RelTime=TrackDuration+1000 > TrackDuration，抖音对"进度超出总时长"判定
     /// 播完切集，停在 ==dur 会被视为未超出而不切集；只返回一次就回退则会被判定
-    /// 进度倒退而不切集）。
+    /// 进度倒退而不切集。iOS/安卓统一走"切下进度到头"策略，2026-08-25）。
     #[test]
     fn force_complete_progressive_when_client_below_one_second() {
         let av = crate::dlna::av_transport::AvTransport::new();
@@ -498,7 +544,7 @@ mod tests {
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:02"));
         assert!(av.force_complete(), "过渡后标志应保持");
-        // 第二次及以后：持续返回超出总时长的进度 30s（29s+1s），标志保持（直到换集/超时）
+        // 第二次及以后：瞬间跳变到超出值 30s（29s+1s），持续保持（不回退）
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
         assert!(av.force_complete(), "返回超出进度后标志应保持（持续确认播完）");
@@ -510,7 +556,9 @@ mod tests {
         assert!(!av.force_complete());
     }
 
-    /// 强制完成：客户端已确认在播（上次回报 ≥1s）→ 直接持续返回超出总时长的进度。
+    /// 强制完成：客户端已确认在播（上次回报 ≥1s）→ **瞬间跳变**到超出总时长的
+    /// 进度后持续保持（与安卓端完全对齐，2026-08-25——两端统一"切下进度到头，
+    /// 客户端自动切下一个"；平滑递增方案已废弃）。
     #[test]
     fn force_complete_direct_when_client_playing() {
         let av = crate::dlna::av_transport::AvTransport::new();
@@ -520,10 +568,11 @@ mod tests {
         // 正常轮询一次，让 last_reported=5s（客户端已确认在播）
         response_params("GetPositionInfo", &av);
         av.set_force_complete();
+        // 已确认在播 → 直接返回超出值 30s（29s+1s，RelTime>TrackDuration）
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
         assert!(av.force_complete(), "返回超出进度后标志应保持");
-        // 下一轮仍返回超出进度（不回退）
+        // 下一轮仍返回超出进度（不回退，持续确认播完）
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:30"));
     }
@@ -538,14 +587,16 @@ mod tests {
         assert_eq!(av.last_reported(), 0);
     }
 
-    /// 短视频伪装（抖音安卓 <=5s 不自动切集适配）：真实时长 <6s 时
-    /// TrackDuration 恒报 6s（假装视频大于 5 秒）；播放中报真实进度；
-    /// 自然播完（前端上报 pos=真实dur+1000）→ 进度报 **7s**（虚拟时长 6s+1s
-    /// 超出——抖音只对 RelTime>TrackDuration 判定播完，==6s 实测不切集）。
+    /// 短视频伪装（**仅抖音源**，抖音安卓 <=5s 不自动切集适配）：抖音源
+    /// URL（douyinvod.com / ott_cast）且真实时长 <6s 时 TrackDuration 恒报 6s
+    /// （假装视频大于 5 秒）；播放中报真实进度；自然播完（前端上报
+    /// pos=真实dur+1000）→ 进度报 **7s**（虚拟时长 6s+1s 超出——抖音只对
+    /// RelTime>TrackDuration 判定播完，==6s 实测不切集）。
+    /// 非抖音源即使短视频也不伪装（其他客户端无此 bug，伪装反显异常）。
     #[test]
     fn short_video_faked_to_six_seconds_on_natural_end() {
         let av = crate::dlna::av_transport::AvTransport::new();
-        av.set_uri("http://x/short.mp4", "");
+        av.set_uri("http://v11-cold1.douyinvod.com/short.mp4?cast_type=ott_cast", "");
         av.update_duration(3_000); // 真实 3s（<6s）
         // 播放中：报真实进度，TrackDuration 报 6s
         av.update_position(2_000);
@@ -557,13 +608,20 @@ mod tests {
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:07"));
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:06"));
+        // 非抖音源（其他客户端投屏）短视频 → 不伪装，按真实时长返回
+        av.set_uri("http://example.com/short.mp4", "");
+        av.update_duration(3_000);
+        av.update_position(4_000); // 播完信号 pos=dur+1000
+        let m = response_params("GetPositionInfo", &av);
+        assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:03"));
+        assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:04"));
     }
 
-    /// 短视频伪装：按下切集（force_complete）→ 进度返回 7s（虚拟时长 6s+1s 超出）。
+    /// 短视频伪装：抖音源按下切集（force_complete）→ 进度返回 7s（虚拟时长 6s+1s 超出）。
     #[test]
     fn short_video_faked_to_six_seconds_on_force_complete() {
         let av = crate::dlna::av_transport::AvTransport::new();
-        av.set_uri("http://x/short.mp4", "");
+        av.set_uri("http://v13-cold.douyinvod.com/short.mp4", ""); // 仅 douyinvod 域名也可识别
         av.update_duration(4_000); // 真实 4s（<6s）
         av.update_position(1_000);
         av.set_force_complete();
@@ -575,13 +633,13 @@ mod tests {
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:07"));
     }
 
-    /// 短视频伪装边界：抖音按整数秒截断判定（5163ms 也被当 5s），
+    /// 短视频伪装边界（抖音源）：抖音按整数秒截断判定（5163ms 也被当 5s），
     /// 故真实时长 <6000ms 一律伪装成 6s 时长、播完/切集进度 7s；
     /// 恰好 6000ms（截断 6s>5s）不伪装；时长未知（流式）不伪装。
     #[test]
     fn short_video_fake_boundary() {
         let av = crate::dlna::av_transport::AvTransport::new();
-        av.set_uri("http://x/b.mp4", "");
+        av.set_uri("http://v.douyinvod.com/b.mp4?cast_type=ott_cast", "");
         // 恰好 5s → 伪装 6s 时长、播完进度 7s
         av.update_duration(5_000);
         av.update_position(5_000);
@@ -589,21 +647,21 @@ mod tests {
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:06"));
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:07"));
         // 5.163s（真实日志场景，抖音整数秒截断当 5s）→ 也要伪装（时长 6s、进度 7s）
-        av.set_uri("http://x/b2.mp4", "");
+        av.set_uri("http://v.douyinvod.com/b2.mp4", "");
         av.update_duration(5_163);
         av.update_position(6_163); // 播完/切集上报的超实时长进度
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:06"));
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:07"));
         // 恰好 6s（截断 6s>5s）→ 不伪装，按真实时长返回
-        av.set_uri("http://x/c.mp4", "");
+        av.set_uri("http://v.douyinvod.com/c.mp4", "");
         av.update_duration(6_000);
         av.update_position(6_000);
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:06"));
         assert_eq!(m.get("RelTime").map(|s| s.as_str()), Some("00:00:06"));
         // 时长未知（流式 dur=0）→ 不伪装，进度按真实值
-        av.set_uri("http://x/d.mp4", "");
+        av.set_uri("http://v.douyinvod.com/d.mp4", "");
         av.update_position(3_000);
         let m = response_params("GetPositionInfo", &av);
         assert_eq!(m.get("TrackDuration").map(|s| s.as_str()), Some("00:00:00"));
