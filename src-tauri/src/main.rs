@@ -49,6 +49,8 @@ fn devtools_enabled() -> bool {
 // 投屏播放叠层脚本（注入到 web-runtime 页面，监听 dlna://play 全屏播放）。
 // 通过 WebviewWindowBuilder.initialization_script 注入，不改 web-runtime 本体。
 const DLNA_OVERLAY_JS: &str = include_str!("../dlna_overlay.js");
+// 投屏「扫码看广告解锁」叠层：经 initialization_script 注入，不改 web-runtime 本体。
+const AD_UNLOCK_JS: &str = include_str!("../ad_unlock_overlay.js");
 // 缩放自适应 + es_pkg 预加载：经 initialization_script 注入，不改 web-runtime 本体。
 const UI_SCALE_JS: &str = include_str!("../ui_scale.js");
 // 跨域代理注入（绕过浏览器 CORS，让 es_pkg 的 resolve / zip 下载走 Rust reqwest）。
@@ -118,6 +120,7 @@ fn main() {
                 .fullscreen(false)
                 .center()
                 .initialization_script(DLNA_OVERLAY_JS)
+                .initialization_script(AD_UNLOCK_JS)
                 .initialization_script(&es_pkg_js)
                 .initialization_script(UI_SCALE_JS)
                 .initialization_script(PROXY_FETCH_JS)
