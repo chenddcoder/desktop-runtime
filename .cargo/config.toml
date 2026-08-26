@@ -1,0 +1,4 @@
+# 仅用于在本机（macOS）交叉编译 Windows 目标。
+# macOS 本机构建（aarch64 / universal）不受此配置影响。
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
