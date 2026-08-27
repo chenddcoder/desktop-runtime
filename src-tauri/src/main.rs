@@ -4,6 +4,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod dlna;
+pub mod http_download;
 pub mod media_proxy;
 pub mod proxy;
 
@@ -47,20 +48,16 @@ fn devtools_enabled() -> bool {
     false
 }
 
+// 缩放自适应 + es_pkg 预加载：经 initialization_script 注入，不改 web-runtime 本体。
+const UI_SCALE_JS: &str = include_str!("../ui_scale.js");
+// 注：跨域请求代理已由「注入式 proxy_fetch.js 拦截 fetch/XHR」迁移为
+// web-runtime 源码内 tauriEnv 适配模块（tauri 环境 → invoke proxy_http / http_download_*，
+// Rust reqwest 发出）。此处不再注入 proxy_fetch.js / media_proxy.js（视频流改为直连）。
 // 投屏播放叠层脚本（注入到 web-runtime 页面，监听 dlna://play 全屏播放）。
 // 通过 WebviewWindowBuilder.initialization_script 注入，不改 web-runtime 本体。
 const DLNA_OVERLAY_JS: &str = include_str!("../dlna_overlay.js");
 // 投屏「扫码看广告解锁」叠层：经 initialization_script 注入，不改 web-runtime 本体。
 const AD_UNLOCK_JS: &str = include_str!("../ad_unlock_overlay.js");
-// 缩放自适应 + es_pkg 预加载：经 initialization_script 注入，不改 web-runtime 本体。
-const UI_SCALE_JS: &str = include_str!("../ui_scale.js");
-// 跨域代理注入（绕过浏览器 CORS，让 es_pkg 的 resolve / zip 下载走 Rust reqwest）。
-const PROXY_FETCH_JS: &str = include_str!("../proxy_fetch.js");
-// 回环流式媒体代理注入（hook video.src → 127.0.0.1:5200/media，解决抖音 302 调度 URL
-// 在 <video> 下每次 Range/重连/切集都重新 302 导致连续性断裂卡进度的问题）。
-const MEDIA_PROXY_JS: &str = include_str!("../media_proxy.js");
-// 媒体代理端口（须先于 MEDIA_PROXY_JS 注入，供其读取）
-const MEDIA_PROXY_PORT: u16 = 5200;
 // 调试 HUD（仅 DEBUG 构建注入；release 不编译此常量，故发布版二进制不含任何调试浮层）。
 #[cfg(debug_assertions)]
 const DEBUG_HUD_JS: &str = include_str!("../debug_hud.js");
@@ -148,8 +145,6 @@ fn main() {
                 "window.__ES_DEFAULT_PKG__ = {};",
                 serde_json::to_string(&es_pkg).unwrap_or_else(|_| "\"cn.chenddcoder.tvcast\"".into())
             );
-            // 媒体代理端口常量（须先于 MEDIA_PROXY_JS 执行）
-            let media_port_js = format!("window.__MEDIA_PROXY_PORT__ = {};", MEDIA_PROXY_PORT);
             eprintln!("[desktop-runtime] default es_pkg={es_pkg} appName={app_name}");
             let mut window_builder = WebviewWindowBuilder::new(app, "main", url)
                 .title(&app_name)
@@ -162,10 +157,7 @@ fn main() {
                 .initialization_script(DLNA_OVERLAY_JS)
                 .initialization_script(AD_UNLOCK_JS)
                 .initialization_script(&es_pkg_js)
-                .initialization_script(UI_SCALE_JS)
-                .initialization_script(PROXY_FETCH_JS)
-                .initialization_script(&media_port_js)
-                .initialization_script(MEDIA_PROXY_JS);
+                .initialization_script(UI_SCALE_JS);
             // 调试 HUD 仅 DEBUG 构建注入（release 不含，发布版无日志面板 / 状态条）。
             #[cfg(debug_assertions)]
             {
@@ -312,23 +304,28 @@ fn main() {
                 let _ = dlna_emit.emit("dlna://status", payload);
             });
 
-            // ========== 回环流式媒体代理（抖音 302 调度 URL 连续性修复） ==========
-            // 独立常驻服务，失败不致命（video 侧有 media_proxy.js 回退直连兜底）。
-            // 绑定 127.0.0.1，绝不对外开放。
-            {
-                let cache = media_proxy::MediaCache::new();
-                let port = MEDIA_PROXY_PORT;
-                tauri::async_runtime::spawn(async move {
-                    eprintln!("[desktop-runtime] media_proxy spawn: entered (port={port})");
-                    if let Err(e) = media_proxy::run_media_proxy(port, cache).await {
-                        eprintln!("[desktop-runtime] media_proxy error: {e}");
-                    }
-                });
-            }
+            // ========== 回环流式媒体代理（已停用） ==========
+            // 之前 media_proxy.js 把 video.src 改写为 127.0.0.1:5200/media 解决抖音 302
+            // 调度 URL 连续性；现按需求改为视频直连，不再启动该服务。
+            // media_proxy.rs 代码保留（pub mod），如需恢复在此 spawn 即可。
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![dlna::dlna_start, dlna::dlna_stop, dlna::dlna_status, dlna::dlna_report_position, dlna::dlna_send_remote_event, dlna::dlna_debug_log, dlna::get_dlna_name, dlna::set_dlna_name, proxy::proxy_http])
+        .manage(http_download::DownloadState::default())
+        .invoke_handler(tauri::generate_handler![
+            dlna::dlna_start,
+            dlna::dlna_stop,
+            dlna::dlna_status,
+            dlna::dlna_report_position,
+            dlna::dlna_send_remote_event,
+            dlna::dlna_debug_log,
+            dlna::get_dlna_name,
+            dlna::set_dlna_name,
+            proxy::proxy_http,
+            http_download::http_download_open,
+            http_download::http_download_read,
+            http_download::http_download_close
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
