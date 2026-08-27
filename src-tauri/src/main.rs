@@ -15,32 +15,34 @@ use tauri::{
 // TV 端比例：1920 / 1080 = 16:9
 const TV_ASPECT: f64 = 16.0 / 9.0;
 
-// DevTools 开关：默认关闭。需要开启时，在项目根目录（或可执行文件旁）放 devtools.json：
-//   { "enabled": true }
-// 仅在 debug 构建生效；release 构建不含 devtools feature，open_devtools 不会编译进包。
-#[cfg(debug_assertions)]
-fn devtools_enabled() -> bool {
-    // 以「项目根目录（current_dir，npm run dev 时为 desktop-runtime 根）」为权威：
-    // 根目录有明确 enabled 声明即以它为准 —— 这样即使 target/debug 里遗留了 enabled=true，
-    // 也不会覆盖根目录的关闭意图（之前 devtools 关不掉的坑就源于此）。
-    // 仅当根目录没有 devtools.json / 无 enabled 字段时，才兜底读可执行文件旁（打包态）。
+// 运行时布尔开关（devtools.json）：默认关闭。需要开启时，在项目根目录
+// （或可执行文件旁）放 devtools.json：
+//   { "enabled": true, "diagnostics": true }
+//  - enabled:      DevTools 窗口（仅 debug 构建生效，release 不含 devtools feature）
+//  - diagnostics:  投屏诊断注入（dev/release 通用；注入 diagnostics.js 捕获
+//                  video error / console / 事件时间线，打回 Rust 日志文件）
+// 以「项目根目录（current_dir，npm run dev 时为 desktop-runtime 根）」为权威：
+// 根目录有明确声明即以它为准 —— 这样即使 target/debug 里遗留了 enabled=true，
+// 也不会覆盖根目录的关闭意图（之前 devtools 关不掉的坑就源于此）。
+// 仅当根目录没有 devtools.json / 无该字段时，才兜底读可执行文件旁（打包态）。
+fn json_flag(flag: &str) -> bool {
     if let Ok(d) = std::env::current_dir() {
         let p = d.join("devtools.json");
         if let Ok(text) = std::fs::read_to_string(&p) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(b) = v.get("enabled").and_then(|x| x.as_bool()) {
+                if let Some(b) = v.get(flag).and_then(|x| x.as_bool()) {
                     return b; // 根目录有明确声明 → 以此为最终值
                 }
             }
         }
     }
-    // 兜底：根目录无 devtools.json 或无 enabled 字段时，读可执行文件旁（打包态）。
+    // 兜底：根目录无 devtools.json 或无该字段时，读可执行文件旁（打包态）。
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             let p = parent.join("devtools.json");
             if let Ok(text) = std::fs::read_to_string(&p) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    return v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false);
+                    return v.get(flag).and_then(|x| x.as_bool()).unwrap_or(false);
                 }
             }
         }
@@ -48,25 +50,38 @@ fn devtools_enabled() -> bool {
     false
 }
 
+// DevTools 开关：仅 debug 构建生效（release 构建不含 devtools feature）。
+#[cfg(debug_assertions)]
+fn devtools_enabled() -> bool {
+    json_flag("enabled")
+}
+
+// 投屏诊断注入开关：dev/release 通用（release 下遇到 webview 侧问题排查时开启）。
+fn diagnostics_enabled() -> bool {
+    json_flag("diagnostics")
+}
+
 // 缩放自适应 + es_pkg 预加载：经 initialization_script 注入，不改 web-runtime 本体。
 const UI_SCALE_JS: &str = include_str!("../ui_scale.js");
 // 注：跨域请求代理已由「注入式 proxy_fetch.js 拦截 fetch/XHR」迁移为
 // web-runtime 源码内 tauriEnv 适配模块（tauri 环境 → invoke proxy_http / http_download_*，
-// Rust reqwest 发出）。此处不再注入 proxy_fetch.js / media_proxy.js（视频流改为直连）。
+// Rust reqwest 发出）。此处不再注入 proxy_fetch.js。
 // 投屏播放叠层脚本（注入到 web-runtime 页面，监听 dlna://play 全屏播放）。
 // 通过 WebviewWindowBuilder.initialization_script 注入，不改 web-runtime 本体。
 const DLNA_OVERLAY_JS: &str = include_str!("../dlna_overlay.js");
 // 投屏「扫码看广告解锁」叠层：经 initialization_script 注入，不改 web-runtime 本体。
 const AD_UNLOCK_JS: &str = include_str!("../ad_unlock_overlay.js");
-// 调试 HUD（仅 DEBUG 构建注入；release 不编译此常量，故发布版二进制不含任何调试浮层）。
+// 投屏诊断注入（可选，devtools.json 的 "diagnostics": true 开启；默认不注入）：
+// 捕获 video error / console / 未处理异常 / video 事件时间线，经 dlna_debug_log 打回
+// Rust 日志文件，并渲染常驻诊断面板 + 错误红条。排查 release webview 侧问题时开启。
+const DIAGNOSTICS_JS: &str = include_str!("../diagnostics.js");
+// 调试 HUD（左上 DLNA 状态条 + 右下日志面板）。
 #[cfg(debug_assertions)]
 const DEBUG_HUD_JS: &str = include_str!("../debug_hud.js");
-// 发布版反破解 + 剔除 web-runtime 自带调试工具：
-//   1) 屏蔽右键上下文菜单 + 审查元素快捷键（devtools feature 在 release 也已关闭）；
-//   2) 移除 web-runtime index.html 里的开发者调试面板（右上角 #controls-panel，含上传 ZIP/URL 加载/
-//      强制刷新，以及 #drop-zone 拖拽加载区）—— 这些仅开发态有用，发布版不应出现。
-// 仅 release 注入；dev 态保留右键与调试工具方便排查。不影响 39001 开发态与线上 runtime（它们不加载本脚本）。
-#[cfg(not(debug_assertions))]
+// 发布版反破解 + 剔除 web-runtime 自带调试工具（右键/F12/controls-panel/drop-zone）。
+// 排查期（2026-08-27）：临时不注入，保持与 dev 注入集合一致，避免「移除浮层」成为变量。
+// 定位 release 播放问题后按需恢复。
+#[allow(dead_code)]
 const ANTI_TAMPER_JS: &str = r#"
 (function () {
   // 防破解：屏蔽右键上下文菜单 + 审查元素快捷键
@@ -158,15 +173,19 @@ fn main() {
                 .initialization_script(AD_UNLOCK_JS)
                 .initialization_script(&es_pkg_js)
                 .initialization_script(UI_SCALE_JS);
-            // 调试 HUD 仅 DEBUG 构建注入（release 不含，发布版无日志面板 / 状态条）。
+            // 调试 HUD 仅 DEBUG 构建注入（release 不注入，发布版无调试浮层）。
             #[cfg(debug_assertions)]
             {
                 window_builder = window_builder.initialization_script(DEBUG_HUD_JS);
             }
-            // 发布版反破解注入（屏蔽右键菜单 + 审查元素快捷键）。
+            // 发布版反破解注入（屏蔽右键菜单 + 审查元素快捷键 + 移除调试面板）。
             #[cfg(not(debug_assertions))]
             {
                 window_builder = window_builder.initialization_script(ANTI_TAMPER_JS);
+            }
+            // 投屏诊断注入（dev/release 通用；devtools.json 的 "diagnostics": true 开启）。
+            if diagnostics_enabled() {
+                window_builder = window_builder.initialization_script(DIAGNOSTICS_JS);
             }
             let window = window_builder
                 .build()
@@ -305,9 +324,11 @@ fn main() {
             });
 
             // ========== 回环流式媒体代理（已停用） ==========
-            // 之前 media_proxy.js 把 video.src 改写为 127.0.0.1:5200/media 解决抖音 302
-            // 调度 URL 连续性；现按需求改为视频直连，不再启动该服务。
-            // media_proxy.rs 代码保留（pub mod），如需恢复在此 spawn 即可。
+            // 抖音投屏 URL（ott_cast，jump_ttl=1）是 302 一次性签名调度链接，<video> 直连
+            // 可能加载失败。media_proxy（127.0.0.1:5200 带 douyin Referer 跟随 302 + 缓存
+            // 稳定节点）可修复——但用户实测恢复后问题依旧，判定非代理根因（2026-08-27）。
+            // 保持「不代理」（video 直连）以便对照 dev；media_proxy.rs/js 保留，如确认需要
+            // 在此恢复 spawn + 注入即可。
 
             Ok(())
         })

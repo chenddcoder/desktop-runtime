@@ -178,9 +178,15 @@ pub async fn http_download_read(
     // 锁内 take 出 Receiver（MutexGuard 不能跨 await），处理完放回
     let mut rx = {
         let mut map = state.0.lock().unwrap();
-        let slot = map
-            .get_mut(&session_id)
-            .ok_or_else(|| "http_download session not found".to_string())?;
+        let slot = match map.get_mut(&session_id) {
+            Some(s) => s,
+            None => {
+                // 会话不存在：可能上次 read 已读完整个流（小文件单块读完即清理）
+                // 或被 close。幂等返回空块，前端按 byteLength == 0 收尾，避免
+                // 「小文件下载被误判失败」（此前 506KB 的 es_pkg zip 即踩此坑）。
+                return Ok(tauri::ipc::Response::new(Vec::new()));
+            }
+        };
         slot.take().ok_or_else(|| "http_download session busy".to_string())?
     };
 

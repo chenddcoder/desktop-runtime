@@ -15,12 +15,13 @@ pub mod playlist;
 pub mod soap;
 pub mod ssdp;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::broadcast;
 
 use av_transport::AvTransport;
@@ -600,11 +601,47 @@ fn random_digits(len: usize) -> String {
 
 /// 诊断上报：dlna_overlay.js 把 webview 侧链路状态打回 Rust 终端（eprintln），
 /// 用于在看不到 webview 控制台时确认真实环境里投屏事件是否到达快应用。
+/// 同时追加写入日志文件（app_log_dir/desktop-runtime.log），方便 release 包
+/// （无控制台）把 webview 错误详情取回排查。
 #[tauri::command]
-pub fn dlna_debug_log(msg: String, data: Option<serde_json::Value>) -> Result<(), String> {
+pub fn dlna_debug_log(
+    app: tauri::AppHandle,
+    msg: String,
+    data: Option<serde_json::Value>,
+) -> Result<(), String> {
     let data = data.unwrap_or(serde_json::Value::Null);
     eprintln!("[dlna_debug_log] {msg} data={data}");
+    // 同时写多个候选目录（macOS release 为沙盒应用，dirs 解析到 container 内路径，
+    // 与 dev 的非沙盒路径不同；写多处保证至少一处成功）：
+    //   - app_log_dir:  ~/Library/Logs/<id>            （dev 无沙盒时）
+    //   - app_data_dir: ~/Library/Application Support/<id>（dev）/
+    //                   ~/Library/Containers/<id>/Data/Library/Application Support/<id>（release 沙盒）
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(dir) = app.path().app_log_dir() {
+        candidates.push(dir);
+    }
+    if let Ok(dir) = app.path().app_data_dir() {
+        candidates.push(dir);
+    }
+    for dir in candidates {
+        if std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let file = dir.join("desktop-runtime.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(file) {
+            use std::io::Write;
+            let _ = writeln!(f, "[{}] {msg} data={data}", now_log_ts());
+        }
+    }
     Ok(())
+}
+
+fn now_log_ts() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_default()
 }
 
 /// 同步取本机局域网 IPv4（仅用于默认名兜底，失败回空串）。
