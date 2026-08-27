@@ -17,6 +17,7 @@ const TV_ASPECT: f64 = 16.0 / 9.0;
 // DevTools 开关：默认关闭。需要开启时，在项目根目录（或可执行文件旁）放 devtools.json：
 //   { "enabled": true }
 // 仅在 debug 构建生效；release 构建不含 devtools feature，open_devtools 不会编译进包。
+#[cfg(debug_assertions)]
 fn devtools_enabled() -> bool {
     // 以「项目根目录（current_dir，npm run dev 时为 desktop-runtime 根）」为权威：
     // 根目录有明确 enabled 声明即以它为准 —— 这样即使 target/debug 里遗留了 enabled=true，
@@ -60,6 +61,45 @@ const PROXY_FETCH_JS: &str = include_str!("../proxy_fetch.js");
 const MEDIA_PROXY_JS: &str = include_str!("../media_proxy.js");
 // 媒体代理端口（须先于 MEDIA_PROXY_JS 注入，供其读取）
 const MEDIA_PROXY_PORT: u16 = 5200;
+// 调试 HUD（仅 DEBUG 构建注入；release 不编译此常量，故发布版二进制不含任何调试浮层）。
+#[cfg(debug_assertions)]
+const DEBUG_HUD_JS: &str = include_str!("../debug_hud.js");
+// 发布版反破解 + 剔除 web-runtime 自带调试工具：
+//   1) 屏蔽右键上下文菜单 + 审查元素快捷键（devtools feature 在 release 也已关闭）；
+//   2) 移除 web-runtime index.html 里的开发者调试面板（右上角 #controls-panel，含上传 ZIP/URL 加载/
+//      强制刷新，以及 #drop-zone 拖拽加载区）—— 这些仅开发态有用，发布版不应出现。
+// 仅 release 注入；dev 态保留右键与调试工具方便排查。不影响 39001 开发态与线上 runtime（它们不加载本脚本）。
+#[cfg(not(debug_assertions))]
+const ANTI_TAMPER_JS: &str = r#"
+(function () {
+  // 防破解：屏蔽右键上下文菜单 + 审查元素快捷键
+  document.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'F12') { e.preventDefault(); return; }
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'I' || e.key === 'i')) { e.preventDefault(); }
+  });
+  // 发布版剔除 web-runtime 自带的开发者调试工具（右上角 controls-panel + 拖拽加载区 drop-zone）。
+  // 先用 CSS 隐藏防闪烁，再在 DOM 就绪后移除节点。
+  var hideCss = '#controls-panel,#drop-zone{display:none!important}';
+  var styleEl = document.createElement('style');
+  styleEl.textContent = hideCss;
+  (document.head || document.documentElement).appendChild(styleEl);
+  function removeDevTools() {
+    var cp = document.getElementById('controls-panel');
+    if (cp && cp.parentNode) cp.parentNode.removeChild(cp);
+    var dz = document.getElementById('drop-zone');
+    if (dz && dz.parentNode) dz.parentNode.removeChild(dz);
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', removeDevTools);
+  } else {
+    removeDevTools();
+  }
+  // 阻断文件拖入 webview 触发 ZIP/目录 sideload 加载（release 不应保留此调试入口）
+  window.addEventListener('dragover', function (e) { e.preventDefault(); e.stopPropagation(); }, true);
+  window.addEventListener('drop', function (e) { e.preventDefault(); e.stopPropagation(); }, true);
+})();
+"#;
 
 // 默认加载的快应用配置（es-app.config.json，编译期注入）。
 // 想打包成另一个桌面应用（如天气），只改这个文件：{"esPackage":"cn.chenddcoder.weather","appName":"天气"}
@@ -111,7 +151,7 @@ fn main() {
             // 媒体代理端口常量（须先于 MEDIA_PROXY_JS 执行）
             let media_port_js = format!("window.__MEDIA_PROXY_PORT__ = {};", MEDIA_PROXY_PORT);
             eprintln!("[desktop-runtime] default es_pkg={es_pkg} appName={app_name}");
-            let window = WebviewWindowBuilder::new(app, "main", url)
+            let mut window_builder = WebviewWindowBuilder::new(app, "main", url)
                 .title(&app_name)
                 .inner_size(1600.0, 900.0)
                 .min_inner_size(640.0, 360.0)
@@ -125,7 +165,18 @@ fn main() {
                 .initialization_script(UI_SCALE_JS)
                 .initialization_script(PROXY_FETCH_JS)
                 .initialization_script(&media_port_js)
-                .initialization_script(MEDIA_PROXY_JS)
+                .initialization_script(MEDIA_PROXY_JS);
+            // 调试 HUD 仅 DEBUG 构建注入（release 不含，发布版无日志面板 / 状态条）。
+            #[cfg(debug_assertions)]
+            {
+                window_builder = window_builder.initialization_script(DEBUG_HUD_JS);
+            }
+            // 发布版反破解注入（屏蔽右键菜单 + 审查元素快捷键）。
+            #[cfg(not(debug_assertions))]
+            {
+                window_builder = window_builder.initialization_script(ANTI_TAMPER_JS);
+            }
+            let window = window_builder
                 .build()
                 .expect("failed to build main window");
 

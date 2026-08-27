@@ -10,7 +10,7 @@ rust-version = "1.77"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
@@ -31,4 +31,7 @@ chrono = "0.4"
 
 [features]
 # 默认关闭自定义-protocol，开发态用 devUrl(http) 即可
-default = []
+default = ["devtools"]
+# devtools（审查元素）仅开发态需要；发布构建用 --no-default-features 排除，
+# 使 release 二进制不含 webview devtools 能力，从根上屏蔽"审查元素/检查"。
+devtools = ["tauri/devtools"]
