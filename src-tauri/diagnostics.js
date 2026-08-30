@@ -66,9 +66,23 @@
       var all = document.querySelectorAll('video');
       for (var i = 0; i < all.length; i++) {
         var v = all[i];
-        if (v.__diagSeen === v.currentSrc) continue;
-        v.__diagSeen = v.currentSrc;
-        vlog('snap rs=' + v.readyState + ' ns=' + v.networkState + ' err=' + ((v.error && v.error.code) || '-'), v);
+        // 快照携带 hls 实例状态 + buffered（排查「waiting/stalled 但无 error」的静默卡住）
+        var extra = '';
+        try {
+          var hls = v.__hlsInstance;
+          if (hls) {
+            extra += ' hlsUrl=' + String(hls.url || '').slice(0, 80) +
+              ' levels=' + (hls.levels ? hls.levels.length : -1) +
+              ' curLevel=' + hls.currentLevel +
+              ' media=' + !!hls.media;
+          }
+          var bEnd = 0;
+          if (v.buffered && v.buffered.length > 0) bEnd = v.buffered.end(v.buffered.length - 1);
+          extra += ' bufEnd=' + bEnd.toFixed(2) + ' ct=' + (v.currentTime || 0).toFixed(2);
+        } catch (e5) {}
+        if (v.__diagSeen === v.currentSrc + extra) continue;
+        v.__diagSeen = v.currentSrc + extra;
+        vlog('snap rs=' + v.readyState + ' ns=' + v.networkState + ' err=' + ((v.error && v.error.code) || '-') + extra, v);
       }
     } catch (e) {}
   }, 1500);
@@ -156,6 +170,44 @@
     } catch (e) {}
     return _origWarn.apply(console, arguments);
   };
+
+  // console.log 定向转发（排查 m3u8/HLS 链路：IJKPlayerComponent / hls.js / autoProxy /
+  // tauriEnv 关键日志平时走 console.log 不落盘，release 下完全不可见 → 定向前缀过滤）
+  var _origLog = console.log;
+  console.log = function () {
+    try {
+      var args = Array.prototype.slice.call(arguments);
+      var line = args.map(jsonish).join(' ').slice(0, 1200);
+      if (/IJKPlayer|HLS|hls\.js|m3u8|casting|AutoProxy|tauriEnv|es3-video-player/i.test(line)) {
+        reportDiag('console.log', line);
+      }
+    } catch (e) {}
+    return _origLog.apply(console, arguments);
+  };
+
+  // ===== hls.js 实例错误捕获（含非 fatal —— 静默重试中的错误也要可见） =====
+  // 快照轮询里发现 video.__hlsInstance（es3-video-player.js 挂的调试引用）后挂钩：
+  // hls.js 的事件总线事件名常量 Hls.Events.ERROR === 'hlsError'，直接用字符串监听。
+  setInterval(function () {
+    try {
+      var all = document.querySelectorAll('video');
+      for (var i = 0; i < all.length; i++) {
+        var hls = all[i].__hlsInstance;
+        if (!hls || hls.__diagHooked) continue;
+        hls.__diagHooked = true;
+        hls.on('hlsError', function (evt, data) {
+          try {
+            reportDiag('hls-error',
+              'fatal=' + (data && data.fatal) + ' type=' + (data && data.type) +
+              ' details=' + (data && data.details) +
+              ' reason=' + jsonish(data && (data.reason || (data.err && data.err.message))).slice(0, 200) +
+              ' frag=' + jsonish(data && data.frag ? data.frag.url : null).slice(0, 120));
+          } catch (e) {}
+        });
+        reportDiag('hls-hook', 'hls instance hooked, url=' + String(hls.url || '').slice(0, 150));
+      }
+    } catch (e) {}
+  }, 1000);
 
   // ===== JS 运行时错误 + 资源加载错误 + 未处理 Promise 拒绝 =====
   window.addEventListener('error', function (e) {
