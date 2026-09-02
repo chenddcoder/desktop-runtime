@@ -376,11 +376,32 @@
   window.showDlnaStatus = window.showDlnaStatus || function () {};
   window.ensurePanelLoop = window.ensurePanelLoop || function () {};
 
+  // ========== 版本角标：右下角常驻显示应用版本（Rust 侧替换 __APP_VERSION__ 占位符）==========
+  function installVersionBadge() {
+    if (!document.body) {
+      setTimeout(installVersionBadge, 100);
+      return;
+    }
+    if (document.getElementById('__es_desktop_version_badge')) return;
+    var badge = document.createElement('div');
+    badge.id = '__es_desktop_version_badge';
+    badge.textContent = 'v' + '__APP_VERSION__';
+    // 低调常驻：不拦截鼠标事件，避免挡住快应用右下角的按钮/二维码
+    badge.style.cssText =
+      'position:fixed;right:10px;bottom:8px;' +
+      'font:11px/1.4 -apple-system,BlinkMacSystemFont,Helvetica,sans-serif;' +
+      'color:rgba(255,255,255,0.85);background:rgba(0,0,0,0.35);' +
+      'padding:2px 8px;border-radius:8px;z-index:2147483000;' +
+      'pointer-events:none;user-select:none;letter-spacing:0.3px;';
+    document.body.appendChild(badge);
+    dlog('install', '版本角标已挂载', { version: badge.textContent });
+  }
 
   // 启动
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function () { ensurePanelLoop(); listenDlna(); });
+    document.addEventListener('DOMContentLoaded', function () { installVersionBadge(); ensurePanelLoop(); listenDlna(); });
   } else {
+    installVersionBadge();
     ensurePanelLoop();
     listenDlna();
   }

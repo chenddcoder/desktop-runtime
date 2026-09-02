@@ -161,6 +161,11 @@ fn main() {
                 serde_json::to_string(&es_pkg).unwrap_or_else(|_| "\"cn.chenddcoder.tvcast\"".into())
             );
             eprintln!("[desktop-runtime] default es_pkg={es_pkg} appName={app_name}");
+            // 版本号注入：读 tauri.conf.json 的 version（package_info()），替换 overlay 脚本占位符，
+            // 由 dlna_overlay.js 在右下角渲染版本角标（避免 webview 侧再走 Tauri API 权限）
+            let app_version = app.package_info().version.to_string();
+            let dlna_overlay_js = DLNA_OVERLAY_JS.replace("__APP_VERSION__", &app_version);
+            eprintln!("[desktop-runtime] app version={app_version}");
             let mut window_builder = WebviewWindowBuilder::new(app, "main", url)
                 .title(&app_name)
                 .inner_size(1600.0, 900.0)
@@ -169,7 +174,7 @@ fn main() {
                 .maximizable(false)
                 .fullscreen(false)
                 .center()
-                .initialization_script(DLNA_OVERLAY_JS)
+                .initialization_script(&dlna_overlay_js)
                 .initialization_script(AD_UNLOCK_JS)
                 .initialization_script(&es_pkg_js)
                 .initialization_script(UI_SCALE_JS);

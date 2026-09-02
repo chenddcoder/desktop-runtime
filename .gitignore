@@ -16,3 +16,4 @@ src-tauri/gen/schemas/
 Thumbs.db
 .web-runtime-dist-new
 test
+target-check

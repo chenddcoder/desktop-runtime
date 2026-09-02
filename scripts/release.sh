@@ -7,17 +7,21 @@
 #   2. desktop universal 双架构包（rustup cargo）→ 部署到官网 mac 下载
 #
 # 用法：
-#   ./release.sh                  # 全量：构建 web + 桌面，并发布到服务器
+#   ./release.sh                  # 全量：bump 版本 + 构建 web + 桌面，并发布到服务器
 #   ./release.sh --no-upload     # 只本地构建，不上传（自测用）
 #   ./release.sh --web-only      # 只构建+发布 web-runtime
 #   ./release.sh --desktop-only  # 只构建+发布桌面包
 #   ./release.sh --prod          # web-runtime 用生产构建（去 console），默认 build:dev（保留日志）
 #   ./release.sh --skip-web      # 桌面构建跳过 web-runtime 重建（dist 已是最新时用）
+#   ./release.sh --no-bump       # 跳过版本号自动更新
+#   ./release.sh --version 0.2.0 # 显式指定新版本号（默认 patch 段 +1）
 #
 # 环境变量（可选覆盖）：
 #   WEB_RUNTIME_DIR    web-runtime 源码目录（默认 ../quicktvui/packages/web-runtime）
 #   SERVER             服务器（默认 root@chenddcoder.cn）
 #   NODE               node/npx 路径（默认 npx，需 PATH 含 node20）
+#   CARGO_TARGET_DIR   cargo 构建输出目录（默认 src-tauri/target；
+#                      项目卷沙箱可能拦截 target 内文件操作，可指到 ~/ 下绕开）
 #
 set -euo pipefail
 
@@ -37,6 +41,8 @@ DESKTOP_ZIP="QuickAppDesktop-macos-universal.zip"
 export PATH="$HOME/.cargo/bin:$PATH"
 RUSTUP_CARGO="$HOME/.cargo/bin/cargo"
 NODE_BIN="${NODE:-npx}"
+# cargo 构建输出目录（支持外部覆盖；tauri build 会透传给 cargo，bundle 输出在同目录下）
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$SRC_TAURI_DIR/target}"
 
 # ============ 参数解析 ============
 DO_UPLOAD=1
@@ -44,6 +50,8 @@ DO_WEB=1
 DO_DESKTOP=1
 WEB_MODE="build:dev"   # 默认保留日志，便于线上排障
 SKIP_WEB=0
+NO_BUMP=0
+VERSION_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,7 +60,9 @@ while [[ $# -gt 0 ]]; do
     --desktop-only) DO_WEB=0 ;;
     --skip-web)    SKIP_WEB=1 ;;
     --prod)        WEB_MODE="build" ;;
-    -h|--help)     sed -n '3,22p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --no-bump)     NO_BUMP=1 ;;
+    --version)     VERSION_OVERRIDE="$2"; shift ;;
+    -h|--help)     sed -n '3,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "未知参数: $1"; exit 1 ;;
   esac
   shift
@@ -60,6 +70,17 @@ done
 
 log() { echo "==> $*"; }
 die() { echo "✗ $*" >&2; exit 1; }
+
+# ============ 0. 版本号自动更新 ============
+# 同步更新 tauri.conf.json / Cargo.toml / package.json 三处版本（scripts/bump_version.mjs）。
+# 默认 patch 段 +1；--version x.y.z 显式指定；--no-bump 跳过。
+# Cargo.lock 的本地包版本由 cargo build 自动同步，无需手动处理。
+bump_version() {
+  [[ "$NO_BUMP" == 1 ]] && { log "跳过版本号更新（--no-bump）"; return; }
+  log "更新版本号"
+  NEW_VERSION="$(node "$SCRIPT_DIR/bump_version.mjs" "$DESKTOP_DIR" "$VERSION_OVERRIDE")" || die "版本号更新失败"
+  log "版本号: $NEW_VERSION"
+}
 
 # ============ 1. web-runtime 构建 ============
 build_web() {
@@ -94,7 +115,7 @@ build_desktop() {
   cd "$SRC_TAURI_DIR"
   PATH="$HOME/.cargo/bin:$PATH" "$NODE_BIN" tauri build --target universal-apple-darwin --bundles app
 
-  APP_PATH="$SRC_TAURI_DIR/target/universal-apple-darwin/release/bundle/macos/$APP_NAME.app"
+  APP_PATH="$CARGO_TARGET_DIR/universal-apple-darwin/release/bundle/macos/$APP_NAME.app"
   [[ -d "$APP_PATH" ]] || die "universal 包未生成: $APP_PATH"
   log "校验双架构: $(file "$APP_PATH/Contents/MacOS/quickapp-desktop" | head -1)"
 }
@@ -102,7 +123,7 @@ build_desktop() {
 # ============ 3. 打包 zip ============
 pack_zip() {
   [[ "$DO_DESKTOP" != 1 ]] && return
-  MACOS_DIR="$SRC_TAURI_DIR/target/universal-apple-darwin/release/bundle/macos"
+  MACOS_DIR="$CARGO_TARGET_DIR/universal-apple-darwin/release/bundle/macos"
   log "打包 $DESKTOP_ZIP"
   cd "$MACOS_DIR"
   rm -f "/tmp/$DESKTOP_ZIP"
@@ -136,6 +157,7 @@ upload() {
 }
 
 # ============ 执行 ============
+bump_version
 build_web
 build_desktop
 pack_zip
