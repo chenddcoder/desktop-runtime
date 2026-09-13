@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter};
 use crate::dlna::av_transport::AvTransport;
 use crate::dlna::device_desc::DeviceDesc;
 use crate::dlna::soap;
+use crate::dlna::trace::dlog;
 
 pub async fn run_http(
     app: AppHandle,
@@ -104,7 +105,7 @@ async fn handle_conn(
                         break (i, sep);
                     }
                     // 残留/错位数据：丢弃到该段结束，继续找真正的请求行
-                    eprintln!("[dlna_http] skip stale head: tok={tok:?}");
+                    dlog!("[dlna_http] skip stale head: tok={tok:?}");
                     read_buf.drain(..i + sep);
                 }
                 None => {
@@ -166,6 +167,9 @@ async fn handle_conn(
 
         // ---- 3. 处理请求 ----
         if method == "GET" || method == "HEAD" {
+            // 客户端来拉 device-desc.xml（或 SCPD）= 它已认可我们的 SSDP 响应、进入
+            // "读设备能力"阶段。这一行是「搜不到设备」与「搜到但不投」的分界点，必须留痕：
+            // 只看到 M-SEARCH 却没有 GET → 客户端拿到了 LOCATION 但连不上（防火墙/IP 错）。
             match desc.handle(&path) {
                 Some((b, ct)) => {
                     // ⚠️ device-desc.xml 响应重复附加抖音播放列表扩展头（对齐 dlna_demo）：
@@ -185,10 +189,12 @@ async fn handle_conn(
                         } else {
                             (crate::dlna::playlist::wire::STD_SERVER, Vec::new())
                         };
-                    write_response(&mut stream, 200, &ct, &b, conn_keep_alive, server, &extra).await?
+                    write_response(&mut stream, 200, &ct, &b, conn_keep_alive, server, &extra).await?;
+                    dlog!("[dlna_http] {method} {path} from={peer} -> 200 ({}B)", b.len());
                 }
                 None => {
-                    write_response(&mut stream, 404, "text/plain", "Not found", conn_keep_alive, crate::dlna::playlist::wire::STD_SERVER, &[]).await?
+                    write_response(&mut stream, 404, "text/plain", "Not found", conn_keep_alive, crate::dlna::playlist::wire::STD_SERVER, &[]).await?;
+                    dlog!("[dlna_http] {method} {path} from={peer} -> 404 (unknown path)");
                 }
             }
         } else if method == "POST" {
@@ -203,7 +209,7 @@ async fn handle_conn(
                         }
                         brief.push(format!("{k}={}", if v.len() > 60 { &v[..60] } else { v }));
                     }
-                    eprintln!(
+                    dlog!(
                         "[dlna_soap_req] action={} from={} params=[{}]",
                         parsed.action,
                         peer,
@@ -215,22 +221,32 @@ async fn handle_conn(
                         soap::build_soap_response(&parsed.action, &parsed.service_type, &resp_params);
                     // 响应体摘要（截断防刷屏）：用于核对客户端实际收到的 XML 结构是否合规。
                     let flat: String = xml.chars().filter(|c| !c.is_whitespace()).take(160).collect();
-                    eprintln!("[dlna_soap_resp] body={flat}...");
+                    dlog!("[dlna_soap_resp] body={flat}...");
                     match outcome {
                         soap::ActionOutcome::Play(url) => {
-                            // 通知前端：有人把视频投到这台桌面电脑了
-                            let _ = app.emit("dlna://play", serde_json::json!({ "url": url }));
+                            // 通知前端：有人把视频/图片投到这台桌面电脑了。
+                            // mediaType 由 SetAVTransportURI 的 DIDL/URI 判定
+                            // （见 media_kind）：image 时前端走图片层，video/audio 走播放器。
+                            let kind = av.media_kind();
+                            let _ = app.emit(
+                                "dlna://play",
+                                serde_json::json!({ "url": url, "mediaType": kind.as_str() }),
+                            );
+                            dlog!("[dlna_emit] dlna://play mediaType={} url={url}", kind.as_str());
                         }
                         soap::ActionOutcome::Seek(secs) => {
                             // 手机端拖动进度 → 前端 <video> 跟随跳转
                             let _ = app.emit("dlna://seek", serde_json::json!({ "position": secs }));
+                            dlog!("[dlna_emit] dlna://seek position={secs}");
                         }
                         soap::ActionOutcome::Stop => {
                             // 手机端停止投屏 → 前端收起全屏播放层
                             let _ = app.emit("dlna://stop", serde_json::json!({}));
+                            dlog!("[dlna_emit] dlna://stop");
                         }
                         soap::ActionOutcome::Pause => {
                             let _ = app.emit("dlna://pause", serde_json::json!({}));
+                            dlog!("[dlna_emit] dlna://pause");
                         }
                         _ => {}
                     }
@@ -238,6 +254,10 @@ async fn handle_conn(
                         .await?;
                 }
                 None => {
+                    // SOAP 解析失败：把原始报文前 200 字符打出来 —— 客户端用了非标
+                    // 命名空间 / 分块编码 / 首行异常时会走到这里，没有报文就没法定位。
+                    let raw: String = body.chars().take(200).collect();
+                    dlog!("[dlna_soap_req] parse FAILED from={peer} raw={raw:?}");
                     let err = soap::build_soap_error(401, "Invalid SOAP request");
                     write_response(&mut stream, 500, "text/xml; charset=\"utf-8\"", &err, conn_keep_alive, crate::dlna::playlist::wire::STD_SERVER, &[])
                         .await?;
@@ -254,7 +274,7 @@ async fn handle_conn(
                 .map(|l| l.trim().to_string())
                 .collect::<Vec<_>>()
                 .join(" | ");
-            eprintln!("[dlna_http_req] method={method} path={path} from={peer} head=[{brief}]");
+            dlog!("[dlna_http_req] method={method} path={path} from={peer} head=[{brief}]");
             write_response(&mut stream, 501, "text/plain", "Not implemented", conn_keep_alive, crate::dlna::playlist::wire::STD_SERVER, &[])
                 .await?;
         }

@@ -9,5 +9,10 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<!-- macOS 14+ 本地网络权限：DLNA 靠 SSDP 多播发现（入站 239.255.255.250:1900）
+	     与局域网内的 HTTP 控制/媒体连接，两者都属「本地网络」访问。缺此键时系统
+	     **不弹授权框** → 权限静默缺失 → 手机搜不到设备、或搜到但连不上本地端口。 -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>用于在同一局域网内接收手机投屏：监听 DLNA/SSDP 设备发现广播并提供本机投屏控制服务。所有通信仅在本局域网内进行。</string>
 </dict>
 </plist>

@@ -1,7 +1,9 @@
 // 投屏播放叠层 + 屏幕日志面板（由 desktop-runtime 注入到 web-runtime 页面，不改 web-runtime 本体）。
 //
 // 职责：
-//   ① 监听 Rust 端 emit 的 "dlna://play" 事件，用全屏 <video> 播放被投的视频/音频。
+//   ① 监听 Rust 端 emit 的 "dlna://play" 事件（含 url/title/mediaType），经
+//      EventDispatcher 转发给快应用（ACTION_DLNA.playerUrl，对象形态），
+//      由业务层按 mediaType 渲染视频播放器或图片层。
 //   ② 调试日志面板 / DLNA 状态条已拆到 debug_hud.js，仅 DEBUG 构建注入；release 不再包含。
 //
 // __TAURI__ 可能未就绪（initialization_script 早于 withGlobalTauri），轮询等待。
@@ -83,16 +85,25 @@
 
   // 投屏请求 → ACTION_DLNA playerUrl（与 sendNativeEvent 同格式，对象形态）。
   // title 可选：普通投屏 Rust 不带；播放列表切集时带（esapp-tvcast casting 页用于更新标题）。
-  function broadcastPlay(url, title) {
+  // mediaType 可选：'video' | 'audio' | 'image' | 'unknown'，由 Rust 侧按
+  //   SetAVTransportURI 的 CurrentURI + DIDL-Lite 判定（见 dlna/media_kind.rs）。
+  //   华为图库「投屏播放」推的是 JPEG —— 快应用必须走图片层而非 <video>，
+  //   否则 video error → 业务层自 stop → 手机端看到投屏失败（2026-09-13 实测）。
+  function broadcastPlay(url, title, mediaType) {
     if (!url) return false;
-    var payload = { actionType: 'playerUrl', url: url, title: title || '' };
+    var payload = {
+      actionType: 'playerUrl',
+      url: url,
+      title: title || '',
+      mediaType: mediaType || '',
+    };
     if (broadcastToApp('ACTION_DLNA', payload)) {
-      reportDlnaState('forward-play', { ok: true, url: url });
+      reportDlnaState('forward-play', { ok: true, url: url, mediaType: payload.mediaType });
       pendingDlnaPlay = null;
       return true;
     }
     // 快应用 EventDispatcher 尚未就绪：缓存（覆盖旧的），轮询/就绪后补发
-    pendingDlnaPlay = { url: url, title: payload.title };
+    pendingDlnaPlay = { url: url, title: payload.title, mediaType: payload.mediaType };
     dlog('warn', '快应用未就绪，缓存投屏请求待补发', { url: url });
     reportDlnaState('forward-play', { ok: false, url: url, cached: true });
     return false;
@@ -109,7 +120,7 @@
     if (pendingDlnaPlay) {
       var p = pendingDlnaPlay;
       pendingDlnaPlay = null;
-      if (!broadcastPlay(p.url, p.title)) {
+      if (!broadcastPlay(p.url, p.title, p.mediaType)) {
         pendingDlnaPlay = p; // 仍不可用，退回缓存
       }
     }
@@ -128,7 +139,7 @@
       if (pendingDlnaPlay) {
         var p = pendingDlnaPlay;
         pendingDlnaPlay = null;
-        broadcastPlay(p.url, p.title);
+        broadcastPlay(p.url, p.title, p.mediaType);
       }
     });
   }
@@ -140,10 +151,15 @@
     }
     window.__TAURI__.event.listen('dlna://play', function (e) {
       var url = e && e.payload && e.payload.url;
+      // mediaType 必须透传：这是桌面端「投的是图片还是视频」的唯一硬信号。
+      // 丢了它，快应用只能靠 URL 扩展名兜底 —— 而华为图库推的 JPEG 一旦落在
+      // <video> 上必然 error → 业务层自 stop → 手机端显示「投屏失败」
+      // （2026-09-13 实测：后端已判定 mediaType=image，却因本行漏传而前功尽弃）。
+      var mediaType = (e && e.payload && e.payload.mediaType) || '';
       if (url) {
-        dlog('cast-play', '收到投屏请求（转发快应用）', { url: url, title: e.payload.title });
-        reportDlnaState('received-play', { url: url });
-        broadcastPlay(url, e.payload.title);
+        dlog('cast-play', '收到投屏请求（转发快应用）', { url: url, title: e.payload.title, mediaType: mediaType });
+        reportDlnaState('received-play', { url: url, mediaType: mediaType });
+        broadcastPlay(url, e.payload.title, mediaType);
       }
     });
     window.__TAURI__.event.listen('dlna://status', function (e) {

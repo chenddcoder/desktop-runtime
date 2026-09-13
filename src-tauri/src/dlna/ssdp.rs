@@ -12,6 +12,8 @@ use tauri::{AppHandle, Emitter};
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 
+use crate::dlna::trace::dlog;
+
 pub const SSDP_MULTICAST_ADDR: &str = "239.255.255.250";
 pub const SSDP_PORT: u16 = 1900;
 
@@ -46,7 +48,7 @@ pub async fn bind_ssdp(ifaces: &[String]) -> std::io::Result<UdpSocket> {
         if let Ok(ip) = Ipv4Addr::from_str(iface) {
             match socket.join_multicast_v4(multi, ip) {
                 Ok(()) => joined += 1,
-                Err(e) => eprintln!("[dlna_ssdp] join multicast on {iface} failed (skip): {e}"),
+                Err(e) => dlog!("[dlna_ssdp] join multicast on {iface} failed (skip): {e}"),
             }
         }
     }
@@ -57,6 +59,43 @@ pub async fn bind_ssdp(ifaces: &[String]) -> std::io::Result<UdpSocket> {
         ));
     }
     Ok(socket)
+}
+
+/// 启动自检：本机向 SSDP 多播组发一次 M-SEARCH，1.5s 内等自己的响应。
+///
+/// 目的：把「本机多播/权限问题」与「手机端协议不匹配」在日志层面直接分开。macOS 14+ 未授予
+/// 「本地网络」权限时系统会**静默拦截**多播收发 —— 现象是手机搜不到设备、日志里一条入站包
+/// 都没有，极易被误判成协议不兼容。连自己发的搜索都收不到，问题就在本机，与手机无关。
+pub async fn self_check() {
+    let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)).await else {
+        dlog!("[dlna_selfcheck] bind ephemeral port failed, skip");
+        return;
+    };
+    let msg = format!(
+        "M-SEARCH * HTTP/1.1\r\nHOST: {SSDP_MULTICAST_ADDR}:{SSDP_PORT}\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
+    );
+    if let Err(e) = sock
+        .send_to(msg.as_bytes(), (SSDP_MULTICAST_ADDR, SSDP_PORT))
+        .await
+    {
+        dlog!("[dlna_selfcheck] send failed: {e}");
+        return;
+    }
+    let mut buf = [0u8; 2048];
+    match tokio::time::timeout(Duration::from_millis(1500), sock.recv_from(&mut buf)).await {
+        Ok(Ok((n, from))) => {
+            let head = String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            dlog!("[dlna_selfcheck] PASS 本机 SSDP 多播收发正常 from={from} len={n} head={head}");
+        }
+        Ok(Err(e)) => dlog!("[dlna_selfcheck] recv error: {e}"),
+        Err(_) => dlog!(
+            "[dlna_selfcheck] FAIL 1.5s 未收到自己的 SSDP 响应 → 先查本机而非手机：① 系统设置→隐私与安全性→本地网络 是否已授权；② 系统设置→网络→防火墙 是否放行入站；③ 1900 端口是否被别的 DLNA 服务占用"
+        ),
+    }
 }
 
 /// 运行 SSDP：立即发 3 轮 NOTIFY alive，随后每 30s 周期广播，并应答收到的 M-SEARCH。
@@ -100,11 +139,11 @@ pub async fn run_ssdp(
                 let ifaces = crate::dlna::list_local_ipv4();
                 let primary = ifaces.first().cloned().unwrap_or_default();
                 if primary.is_empty() {
-                    eprintln!("[dlna_ssdp] ip probe failed (no active interface), keep current {local_ip}");
+                    dlog!("[dlna_ssdp] ip probe failed (no active interface), keep current {local_ip}");
                     continue;
                 }
                 if primary != local_ip {
-                    eprintln!("[dlna_ssdp] IP changed {local_ip} -> {primary}, rebinding multicast...");
+                    dlog!("[dlna_ssdp] IP changed {local_ip} -> {primary}, rebinding multicast...");
                     // 必须先释放旧 fd：macOS 通配地址 0.0.0.0:1900 不允许双 socket 共存
                     // （SO_REUSEADDR 对通配不生效，实测 os error 48）。
                     *shared.lock().await = None;
@@ -113,19 +152,19 @@ pub async fn run_ssdp(
                             *shared.lock().await = Some(s);
                             local_ip = primary;
                             on_ip_changed(&local_ip);
-                            eprintln!("[dlna_ssdp] rebound on {local_ip}, announcing alive");
+                            dlog!("[dlna_ssdp] rebound on {local_ip}, announcing alive");
                             notify_all(&shared, uuid, &local_ip, http_port, control_port, device_id, service_id).await;
                         }
                         Err(e) => {
                             // 重建失败：尝试用旧 IP 恢复（旧接口可能仍有效，双网卡兜底）
-                            eprintln!("[dlna_ssdp] rebind failed: {e}, restoring old socket...");
+                            dlog!("[dlna_ssdp] rebind failed: {e}, restoring old socket...");
                             match bind_ssdp(&[local_ip.clone()]).await {
                                 Ok(s) => {
                                     *shared.lock().await = Some(s);
-                                    eprintln!("[dlna_ssdp] restored on {local_ip}");
+                                    dlog!("[dlna_ssdp] restored on {local_ip}");
                                 }
                                 Err(e2) => {
-                                    eprintln!("[dlna_ssdp] restore failed too: {e2}, ssdp dead until next probe");
+                                    dlog!("[dlna_ssdp] restore failed too: {e2}, ssdp dead until next probe");
                                 }
                             }
                         }
@@ -141,15 +180,22 @@ pub async fn run_ssdp(
                     // 排查日志：收到 M-SEARCH 即打印来源与 ST（用于判断"搜不到设备"是
                     // 网络隔离（卓易通等虚拟机多播不通）还是 ST 类型不匹配）。
                     let st = st_from_data(&data);
-                    if data.lines().next().map(|l| l.starts_with("M-SEARCH")).unwrap_or(false) {
-                        eprintln!("[dlna_ssdp] M-SEARCH from={addr} st={st:?}");
+                    let first = data.lines().next().unwrap_or("");
+                    if first.starts_with("M-SEARCH") {
+                        dlog!("[dlna_ssdp] M-SEARCH from={addr} st={st:?}");
+                    } else {
+                        // 非 M-SEARCH 入站包也记录：客户端若发了别种报文（DLNA 变体、
+                        // UPnP 事件、首行格式差异如 HTTP/1.0、大小写不同）而被我们忽略，
+                        // 这一行是唯一线索 —— 也是区分「网络不通」和「报文不认」的分界。
+                        let raw: String = data.chars().take(160).collect();
+                        dlog!("[dlna_ssdp] inbound from={addr} first={first:?} raw={raw:?}");
                     }
                     // 通知前端有控制器在搜索我们（用于排查"搜不到"问题）
                     let _ = app.emit(
                         "dlna://msearch",
                         serde_json::json!({
                             "from": addr.ip().to_string(),
-                            "preview": data.lines().next().unwrap_or(""),
+                            "preview": first,
                             "st": st,
                         }),
                     );
@@ -166,7 +212,7 @@ pub async fn run_ssdp(
                                     None => Ok(0),
                                 }
                             };
-                            eprintln!("[dlna_ssdp] M-SEARCH respond to={addr} st={st:?} send={single:?}");
+                            dlog!("[dlna_ssdp] M-SEARCH respond to={addr} st={st:?} send={single:?}");
                             // ② 响应同时发多播组（兼容层保底）：SSDP 客户端加入
                             //    239.255.255.250:1900 组后能收到发往组的所有包（多播不依赖 ARP）。
                             //    卓易通等安卓兼容层虚拟网卡能发多播但不响应 ARP（入站单播
@@ -181,7 +227,7 @@ pub async fn run_ssdp(
                                 }
                             };
                             if let Err(e) = &mcast {
-                                eprintln!("[dlna_ssdp] M-SEARCH respond multicast failed: {e}");
+                                dlog!("[dlna_ssdp] M-SEARCH respond multicast failed: {e}");
                             }
                         }
                         // ③ 补发多播 NOTIFY alive：部分客户端只监听多播主动广播。
@@ -195,7 +241,7 @@ pub async fn run_ssdp(
                                 }
                             };
                             if let Err(e) = r {
-                                eprintln!("[dlna_ssdp] NOTIFY multicast send failed: {e}");
+                                dlog!("[dlna_ssdp] NOTIFY multicast send failed: {e}");
                                 break;
                             }
                         }

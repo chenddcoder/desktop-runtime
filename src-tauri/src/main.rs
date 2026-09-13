@@ -12,6 +12,8 @@ use tauri::{
     Emitter, LogicalPosition, LogicalSize, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
+use crate::dlna::trace::dlog;
+
 // TV 端比例：1920 / 1080 = 16:9
 const TV_ASPECT: f64 = 16.0 / 9.0;
 
@@ -160,12 +162,12 @@ fn main() {
                 "window.__ES_DEFAULT_PKG__ = {};",
                 serde_json::to_string(&es_pkg).unwrap_or_else(|_| "\"cn.chenddcoder.tvcast\"".into())
             );
-            eprintln!("[desktop-runtime] default es_pkg={es_pkg} appName={app_name}");
+            dlog!("[desktop-runtime] default es_pkg={es_pkg} appName={app_name}");
             // 版本号注入：读 tauri.conf.json 的 version（package_info()），替换 overlay 脚本占位符，
             // 由 dlna_overlay.js 在右下角渲染版本角标（避免 webview 侧再走 Tauri API 权限）
             let app_version = app.package_info().version.to_string();
             let dlna_overlay_js = DLNA_OVERLAY_JS.replace("__APP_VERSION__", &app_version);
-            eprintln!("[desktop-runtime] app version={app_version}");
+            dlog!("[desktop-runtime] app version={app_version}");
             let mut window_builder = WebviewWindowBuilder::new(app, "main", url)
                 .title(&app_name)
                 .inner_size(1600.0, 900.0)
@@ -287,7 +289,7 @@ fn main() {
             //
             // 关键：整个 spawn 流程 100% 兜底，**任何**卡住 / 错误都会 emit 一条 status 给前端，
             // 否则错误会被静默吞掉——这是用户上一轮 DLNA 搜不到的根本原因。
-            eprintln!("[desktop-runtime] setup: about to spawn dlna_start");
+            dlog!("[desktop-runtime] setup: about to spawn dlna_start");
             let dlna_emit = app.handle().clone();
             // 1) 立即发一条 starting 标记——证明 Rust 路径到了、spawn 在跑
             let _ = dlna_emit.emit(
@@ -299,13 +301,13 @@ fn main() {
             );
             // 2) 整体 8s 兜底：dlna_start 内部任何卡住（get_local_ip 无外网 / 端口被占 / 防火墙）都会超时退出
             tauri::async_runtime::spawn(async move {
-                eprintln!("[desktop-runtime] dlna spawn: entered");
+                dlog!("[desktop-runtime] dlna spawn: entered");
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(8),
                     dlna::dlna_start(dlna_emit.clone(), Some(5001)),
                 )
                 .await;
-                eprintln!("[desktop-runtime] dlna spawn: finished, result.is_ok={}", result.is_ok());
+                dlog!("[desktop-runtime] dlna spawn: finished, result.is_ok={}", result.is_ok());
                 let payload = match result {
                     Ok(Ok(info)) => serde_json::json!({
                         "ok": true,
@@ -314,11 +316,11 @@ fn main() {
                         "msg": format!("DLNA 已启动 → http://*:{}/device-desc.xml", info.port),
                     }),
                     Ok(Err(e)) => {
-                        eprintln!("[desktop-runtime] dlna_start error: {e}");
+                        dlog!("[desktop-runtime] dlna_start error: {e}");
                         serde_json::json!({ "ok": false, "error": e })
                     }
                     Err(_) => {
-                        eprintln!("[desktop-runtime] dlna_start TIMEOUT after 8s");
+                        dlog!("[desktop-runtime] dlna_start TIMEOUT after 8s");
                         serde_json::json!({
                             "ok": false,
                             "error": "DLNA 启动 8s 超时（可能 1900/5001 端口被占、缺少多播路由、或防火墙拦截 UDP 239.255.255.250:1900）",

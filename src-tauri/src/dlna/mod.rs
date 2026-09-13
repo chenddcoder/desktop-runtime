@@ -11,9 +11,11 @@ pub mod av_transport;
 pub mod device_desc;
 pub mod dlna_name;
 pub mod http_server;
+pub mod media_kind;
 pub mod playlist;
 pub mod soap;
 pub mod ssdp;
+pub mod trace;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +28,7 @@ use tokio::sync::broadcast;
 
 use av_transport::AvTransport;
 use device_desc::DeviceDesc;
+use crate::dlna::trace::dlog;
 
 #[derive(serde::Serialize, Clone)]
 pub struct DlnaStartResult {
@@ -190,21 +193,28 @@ async fn bind_http_port(preferred: u16) -> std::io::Result<u16> {
 
 #[tauri::command]
 pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartResult, String> {
-    eprintln!("[dlna_start] entered, port={:?}", port);
+    // 先把日志落盘再打第一行：release 打包后双击运行时 stderr 无人接管，
+    // 真机投屏排查只能靠事后读文件（路径见下方 "log file:" 行）。
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    trace::init(&log_dir);
+    dlog!("[dlna_start] entered, port={:?}", port);
     let inner = state().clone();
     if inner.running.load(Ordering::SeqCst) {
         return Err("DLNA 服务端已在运行（之前一次启动流程尚未完成或已成功）".into());
     }
 
-    eprintln!("[dlna_start] getting local IP...");
+    dlog!("[dlna_start] getting local IP...");
     let ifaces = list_local_ipv4();
     let local_ip = match ifaces.first() {
         Some(ip) => {
-            eprintln!("[dlna_start] local IP = {ip} (ifaces={ifaces:?})");
+            dlog!("[dlna_start] local IP = {ip} (ifaces={ifaces:?})");
             ip.clone()
         }
         None => {
-            eprintln!("[dlna_start] list_local_ipv4 empty (no active non-loopback IPv4)");
+            dlog!("[dlna_start] list_local_ipv4 empty (no active non-loopback IPv4)");
             return Err(
                 "【步骤1/3 获取本机IP】失败: 未发现活跃的非回环 IPv4 接口（ifconfig 无结果？网卡未连网络？）"
                     .into(),
@@ -231,7 +241,7 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
     // ① 不监听 45165；② control_port=None → SSDP/HTTP 发现层回标准指纹、无扩展头，
     //    抖音投屏退回普通 DLNA 单集链路（短视频 5s 伪装等非列表行为不受影响）。
     let playlist_enabled = playlist::playlist_enabled();
-    eprintln!("[dlna_start] playlist feature enabled={playlist_enabled}");
+    dlog!("[dlna_start] playlist feature enabled={playlist_enabled}");
     let service_id = format!("{}-{}", uuid_simple(), random_digits(4));
     let device_id = playlist::device_id();
     let control_port: Option<u16> = if playlist_enabled {
@@ -250,7 +260,7 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
             inner.shutdown_tx.subscribe(),
             Box::new(move |item| {
                 // 列表当前项变化（手机 Play/AddDramaList/选集命令）→ 通知前端换源播放
-                eprintln!(
+                dlog!(
                     "[dlna_playlist] play request → url={} title={}",
                     item.url,
                     item.title
@@ -275,9 +285,12 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
                         av.play();
                     }
                 }
+                // mediaType 固定 video：本通道是抖音 BDLE 短剧列表，条目恒为视频。
+                // 不用 av.media_kind()——非抖音 URL 时不会 set_uri，读到的会是上一次
+                // 投屏（可能是 image）的残留值。
                 let _ = app_pl.emit(
                     "dlna://play",
-                    serde_json::json!({ "url": item.url, "title": item.title }),
+                    serde_json::json!({ "url": item.url, "title": item.title, "mediaType": "video" }),
                 );
             }),
         )
@@ -285,7 +298,7 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
         {
             Ok(ch) => ch,
             Err(e) => {
-                eprintln!("[dlna_start] playlist channel failed: {e}");
+                dlog!("[dlna_start] playlist channel failed: {e}");
                 return Err(format!(
                     "【步骤2/4 播放列表通道】失败: {e} · 45165/临时端口无法绑定"
                 ));
@@ -293,10 +306,10 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
         };
         let cp = pl_channel.control_port();
         *inner.playlist.lock().unwrap() = Some(pl_channel.clone());
-        eprintln!("[dlna_start] playlist channel port={cp}");
+        dlog!("[dlna_start] playlist channel port={cp}");
         Some(cp)
     } else {
-        eprintln!(
+        dlog!(
             "[dlna_start] playlist feature DISABLED: BDLE channel skipped (开启: DOUYIN_PLAYLIST=1 或 dlna-config.json playlistEnabled=true)"
         );
         None
@@ -304,14 +317,14 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
 
     // —— HTTP server（服务设备描述 + 接收 SOAP 控制）——
     let preferred = port.unwrap_or(5001);
-    eprintln!("[dlna_start] binding HTTP port near {preferred}...");
+    dlog!("[dlna_start] binding HTTP port near {preferred}...");
     let http_port = match bind_http_port(preferred).await {
         Ok(p) => {
-            eprintln!("[dlna_start] HTTP port = {p}");
+            dlog!("[dlna_start] HTTP port = {p}");
             p
         }
         Err(e) => {
-            eprintln!(
+            dlog!(
                 "[dlna_start] bind_http_port({preferred}..{}) failed: kind={:?}, detail={}",
                 preferred + 49,
                 e.kind(),
@@ -348,13 +361,16 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
     });
 
     // —— SSDP（UDP 多播发现，替代 EndpointModule 的 UDP 监听）——
-    eprintln!("[dlna_start] binding SSDP on 239.255.255.250:1900 (ifaces={ifaces:?})");
+    dlog!("[dlna_start] binding SSDP on 239.255.255.250:1900 (ifaces={ifaces:?})");
     let socket = match ssdp::bind_ssdp(&ifaces).await {
-        Ok(s) => s,
+        Ok(s) => {
+            dlog!("[dlna_start] SSDP bind OK on 239.255.255.250:1900 (joined={ifaces:?})");
+            s
+        }
         Err(e) => {
             // SSDP 起不来就关掉已起的 HTTP，避免半拉子状态
             let _ = inner.shutdown_tx.send(());
-            eprintln!(
+            dlog!(
                 "[dlna_start] ssdp_bind failed: kind={:?}, detail={}",
                 e.kind(),
                 e
@@ -388,7 +404,7 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
             &device_id_ssdp,
             &service_id_ssdp,
             Box::new(move |new_ip: &str| {
-                eprintln!("[dlna_start] SSDP rebound, sync playlist device ip={new_ip}");
+                dlog!("[dlna_start] SSDP rebound, sync playlist device ip={new_ip}");
                 if let Some(pl) = &pl_ssdp {
                     pl.set_ip(new_ip.to_string());
                 }
@@ -396,6 +412,12 @@ pub async fn dlna_start(app: AppHandle, port: Option<u16>) -> Result<DlnaStartRe
             &mut shutdown_ssdp,
         )
         .await;
+    });
+
+    // 启动自检（不阻塞主流程，结果只进日志）：把「本机多播/权限问题」与「手机端不兼容」分开。
+    // ⚠️ 自检会让 run_ssdp 打出一条 from=<本机IP> 的 M-SEARCH，那是自检自己发的，不是手机。
+    tokio::spawn(async move {
+        ssdp::self_check().await;
     });
 
     inner.running.store(true, Ordering::SeqCst);
@@ -437,7 +459,7 @@ pub async fn dlna_stop() -> Result<(), String> {
 /// 导致客户端进度条不动、拖动后读回仍是 0，看起来"进度没更新"）。
 #[tauri::command]
 pub fn dlna_report_position(position: u64, duration: u64, playing: bool, paused: bool) {
-    eprintln!(
+    dlog!(
         "[dlna_report_position] position={position}ms duration={duration}ms playing={playing} paused={paused}"
     );
     let inner = state();
@@ -466,7 +488,7 @@ pub async fn dlna_send_remote_event(
 ) -> Result<(), String> {
     let inner = state();
     let data = event_data.unwrap_or(serde_json::Value::Null);
-    eprintln!("[dlna_send_remote_event] {event_name} data={data}");
+    dlog!("[dlna_send_remote_event] {event_name} data={data}");
     let av = match inner.av.lock().unwrap().as_ref() {
         Some(av) => av.clone(),
         None => {
@@ -576,11 +598,14 @@ async fn auto_next(
             // 换源：清 force_complete / 进度 / 时长，置 Playing（GetPositionInfo 回新集状态）
             av.set_uri(&item.url, "");
             av.play();
-            eprintln!("[dlna_playlist] auto-next → dramaId={} url={}", item.drama_id, item.url);
-            // 通知前端换源播放（esapp-tvcast casting onDlnaPlay → initPlay 换源）
+            dlog!("[dlna_playlist] auto-next → dramaId={} url={}", item.drama_id, item.url);
+            // 通知前端换源播放（esapp-tvcast casting onDlnaPlay → initPlay 换源）。
+            // mediaType 固定 video：本路径是抖音短剧列表自动连播，条目恒为视频；
+            // 抖音 URL 无扩展名 + meta 为空 → media_kind 会判成 unknown，直接给
+            // video 更准（前端不必再走扩展名兜底）。
             let _ = app.emit(
                 "dlna://play",
-                serde_json::json!({ "url": item.url, "title": item.title }),
+                serde_json::json!({ "url": item.url, "title": item.title, "mediaType": "video" }),
             );
             // 手机端列表/进度 UI 跟随（normalize_bean 已保证条目结构完整，不触发崩溃）
             pl.push_media_info().await;
@@ -610,7 +635,7 @@ pub fn dlna_debug_log(
     data: Option<serde_json::Value>,
 ) -> Result<(), String> {
     let data = data.unwrap_or(serde_json::Value::Null);
-    eprintln!("[dlna_debug_log] {msg} data={data}");
+    dlog!("[dlna_debug_log] {msg} data={data}");
     // 同时写多个候选目录（macOS release 为沙盒应用，dirs 解析到 container 内路径，
     // 与 dev 的非沙盒路径不同；写多处保证至少一处成功）：
     //   - app_log_dir:  ~/Library/Logs/<id>            （dev 无沙盒时）

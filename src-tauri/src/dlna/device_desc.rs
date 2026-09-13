@@ -46,18 +46,23 @@ impl DeviceDesc {
             .replace('\'', "&apos;")
     }
 
+    /// device-desc.xml：UPnP 设备描述。
+    /// ⚠️ `dlna:X_DLNADOC=DMR-1.50` 是 DLNA 设备标识，**不能省**：华为/荣耀（HarmonyOS
+    /// 投播）与乐播等客户端据此确认「对面是一台标准 DMR」，缺字段时部分客户端直接过滤
+    /// 掉设备（表现为「搜不到设备」）。它的命名空间声明在 root 元素上。
     fn build_device_description(&self) -> String {
         // 先取出广播名快照（Mutex guard 不能跨 format! 占位符作用域存活），再在模板中消费。
         let friendly = Self::escape_xml(&*self.friendly_name.lock().unwrap());
         format!(
             r#"<?xml version="1.0"?>
-<root xmlns="urn:schemas-upnp-org:device-1-0">
+<root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0">
   <specVersion><major>1</major><minor>0</minor></specVersion>
   <device>
     <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
     <friendlyName>{friendly}</friendlyName>
     <manufacturer>QuickAppDesktop</manufacturer>
     <modelName>QuickAppDesktop DMR</modelName>
+    <dlna:X_DLNADOC>DMR-1.50</dlna:X_DLNADOC>
     <UDN>uuid:{uuid}</UDN>
     <serviceList>
       <service>
@@ -162,6 +167,10 @@ impl DeviceDesc {
             .to_string()
     }
 
+    /// ConnectionManager SCPD。
+    /// Sink 段（GetProtocolInfo）用**具体 mime** 而不只是 `video/*`：DLNA 规范里
+    /// `video/*` 属非标写法，严格客户端（部分手机端 SDK / 乐播）按 mime 精确匹配，
+    /// 只见通配会判「无可用 Sink 格式」→ 不投。末尾保留三条通配兜底。
     fn build_connection_manager_scpd() -> String {
         r#"<?xml version="1.0"?>
 <scpd xmlns="urn:schemas-upnp-org:service-1-0">
@@ -190,6 +199,19 @@ impl DeviceDesc {
     <stateVariable sendEvents="yes"><name>SourceProtocolInfo</name><dataType>string</dataType></stateVariable>
     <stateVariable sendEvents="yes"><name>SinkProtocolInfo</name><dataType>string</dataType>
       <allowedValueList>
+        <allowedValue>http-get:*:video/mp4:*</allowedValue>
+        <allowedValue>http-get:*:video/mpeg:*</allowedValue>
+        <allowedValue>http-get:*:video/quicktime:*</allowedValue>
+        <allowedValue>http-get:*:video/webm:*</allowedValue>
+        <allowedValue>http-get:*:video/x-matroska:*</allowedValue>
+        <allowedValue>http-get:*:video/x-msvideo:*</allowedValue>
+        <allowedValue>http-get:*:audio/mpeg:*</allowedValue>
+        <allowedValue>http-get:*:audio/mp4:*</allowedValue>
+        <allowedValue>http-get:*:audio/aac:*</allowedValue>
+        <allowedValue>http-get:*:image/jpeg:*</allowedValue>
+        <allowedValue>http-get:*:image/png:*</allowedValue>
+        <allowedValue>http-get:*:application/vnd.apple.mpegurl:*</allowedValue>
+        <allowedValue>http-get:*:application/x-mpegURL:*</allowedValue>
         <allowedValue>http-get:*:video/*:*</allowedValue>
         <allowedValue>http-get:*:audio/*:*</allowedValue>
         <allowedValue>http-get:*:image/*:*</allowedValue>
@@ -244,8 +266,38 @@ impl DeviceDesc {
     <stateVariable sendEvents="no"><name>VolumeChannel</name><dataType>string</dataType>
       <allowedValueList><allowedValue>Master</allowedValue></allowedValueList>
     </stateVariable>
-  </serviceStateTable>
+      </serviceStateTable>
 </scpd>"#
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn desc() -> DeviceDesc {
+        DeviceDesc::new("test-uuid".into(), "扩展屏".into())
+    }
+
+    #[test]
+    fn device_desc_declares_dlna_dmr_doc() {
+        // 华为/荣耀（HarmonyOS 投播）、乐播等客户端靠这两个字段确认「对面是标准 DMR」，
+        // 缺任一（漏了 root 上的命名空间声明同样无效）会被过滤 → 设备搜不到。
+        // 这是静默失效型回归，用测试锁住。
+        let (xml, _) = desc().handle("/device-desc.xml").unwrap();
+        assert!(xml.contains(r#"xmlns:dlna="urn:schemas-dlna-org:device-1-0""#));
+        assert!(xml.contains("<dlna:X_DLNADOC>DMR-1.50</dlna:X_DLNADOC>"));
+        assert!(xml.contains("<deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>"));
+    }
+
+    #[test]
+    fn connection_manager_sink_lists_concrete_mimes() {
+        // Sink 段（GetProtocolInfo）必须给具体 mime：只列 `video/*` 这类通配时，
+        // 严格客户端判「无可用 Sink 格式」→ 不投。
+        let (xml, _) = desc().handle("/ConnectionManager-scpd.xml").unwrap();
+        assert!(xml.contains("http-get:*:video/mp4:*"));
+        assert!(xml.contains("http-get:*:application/vnd.apple.mpegurl:*"));
+        assert!(xml.contains("http-get:*:video/*:*"));
     }
 }

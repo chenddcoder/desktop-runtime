@@ -23,6 +23,8 @@ use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::dlna::trace::dlog;
+
 /// 最终节点签名有效期兜底（抖音 bdcdn_rkey 一般几分钟到几十分钟）
 const CACHE_TTL: Duration = Duration::from_secs(600);
 /// 302 链最大跳数（jump_ttl=1 的场景两跳内收敛，给余量）
@@ -76,13 +78,13 @@ impl MediaCache {
 /// 启动 127.0.0.1:port 媒体代理（常驻，失败返回 io error）。
 pub async fn run_media_proxy(port: u16, cache: MediaCache) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-    eprintln!("[media_proxy] listening on 127.0.0.1:{port}");
+    dlog!("[media_proxy] listening on 127.0.0.1:{port}");
     loop {
         let (sock, _) = listener.accept().await?;
         let cache = cache.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_conn(sock, cache).await {
-                eprintln!("[media_proxy] conn error: {e}");
+                dlog!("[media_proxy] conn error: {e}");
             }
         });
     }

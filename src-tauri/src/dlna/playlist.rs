@@ -30,6 +30,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::dlna::trace::dlog;
+
 // ---------------------------------------------------------------------------
 // 协议常量（对齐 demo WireCompatibility，不可改名）
 // ---------------------------------------------------------------------------
@@ -762,7 +764,7 @@ impl PlaylistChannel {
         let listener = match TcpListener::bind(("0.0.0.0", wire::PREFERRED_PORT)).await {
             Ok(l) => l,
             Err(_) => {
-                eprintln!(
+                dlog!(
                     "[dlna_playlist] preferred port {} occupied, fallback to ephemeral",
                     wire::PREFERRED_PORT
                 );
@@ -787,7 +789,7 @@ impl PlaylistChannel {
         tokio::spawn(async move {
             ch.accept_loop(listener, shutdown).await;
         });
-        eprintln!(
+        dlog!(
             "[dlna_playlist] channel started host={} port={} frame=uint32LE+JSON crypto=X25519/AES-128-GCM",
             channel.inner.device.lock().unwrap().ip, port
         );
@@ -957,7 +959,7 @@ impl PlaylistChannel {
                 .unwrap_or("<null>".into());
             format!("dramaId={} urlBeans={} url0={}", did, ub, url)
         };
-        eprintln!(
+        dlog!(
             "[dlna_playlist] push_media_info → dramaId={} beans={} curBean[{}] firstBean[{}]",
             drama_id,
             beans,
@@ -1000,14 +1002,14 @@ impl PlaylistChannel {
                             });
                         }
                         Err(e) => {
-                            eprintln!("[dlna_playlist] accept failed: {e}");
+                            dlog!("[dlna_playlist] accept failed: {e}");
                             break;
                         }
                     }
                 }
             }
         }
-        eprintln!("[dlna_playlist] channel stopped");
+        dlog!("[dlna_playlist] channel stopped");
     }
 
     async fn handle_client(&self, stream: TcpStream, peer: std::net::SocketAddr) -> std::io::Result<()> {
@@ -1016,7 +1018,7 @@ impl PlaylistChannel {
         // 写半同时用于「本连接响应」与「PushMediaInfo 广播」，每连接一把锁保证帧不交错
         let write_guard = Arc::new(tokio::sync::Mutex::new(write_half));
         let remote = format!("{peer}");
-        eprintln!("[dlna_playlist] client connected {remote}");
+        dlog!("[dlna_playlist] client connected {remote}");
         self.inner.clients.lock().await.push((peer, write_guard.clone()));
 
         let mut aes_key: Option<[u8; 16]> = None;
@@ -1030,7 +1032,7 @@ impl PlaylistChannel {
                 let envelope: Value = match serde_json::from_slice(&frame) {
                     Ok(v) => v,
                     Err(e) => {
-                        eprintln!("[dlna_playlist] bad json from {remote}: {e}");
+                        dlog!("[dlna_playlist] bad json from {remote}: {e}");
                         continue;
                     }
                 };
@@ -1039,7 +1041,7 @@ impl PlaylistChannel {
                     let key = match aes_key {
                         Some(k) => k,
                         None => {
-                            eprintln!("[dlna_playlist] encrypted frame before key established {remote}");
+                            dlog!("[dlna_playlist] encrypted frame before key established {remote}");
                             continue;
                         }
                     };
@@ -1047,14 +1049,14 @@ impl PlaylistChannel {
                     let plain = match self.inner.crypto.decrypt(&key, encoded) {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!("[dlna_playlist] decrypt failed {remote}: {e}");
+                            dlog!("[dlna_playlist] decrypt failed {remote}: {e}");
                             continue;
                         }
                     };
                     match serde_json::from_slice(&plain) {
                         Ok(v) => v,
                         Err(e) => {
-                            eprintln!("[dlna_playlist] bad decrypted json {remote}: {e}");
+                            dlog!("[dlna_playlist] bad decrypted json {remote}: {e}");
                             continue;
                         }
                     }
@@ -1065,7 +1067,7 @@ impl PlaylistChannel {
                 // 手机 X25519 公钥在 content.sourceInfo（可能多包一层），递归查找
                 if let Some(peer_key) = first_str(&content, &["preSharedKey"]) {
                     aes_key = self.inner.crypto.derive_aes_key(&peer_key);
-                    eprintln!(
+                    dlog!(
                         "[dlna_playlist] session key established remote={remote} peerKeyLength={}",
                         peer_key.len()
                     );
@@ -1078,10 +1080,10 @@ impl PlaylistChannel {
 
                 // 对端带 code 的包是响应，只记录不再回 ACK（防回包循环）
                 if content.get("code").is_some() {
-                    eprintln!("[dlna_playlist] recv response cmd={command} messageId={message_id}");
+                    dlog!("[dlna_playlist] recv response cmd={command} messageId={message_id}");
                     continue;
                 }
-                eprintln!("[dlna_playlist] recv cmd={command} messageId={message_id} encrypted={encrypted}");
+                dlog!("[dlna_playlist] recv cmd={command} messageId={message_id} encrypted={encrypted}");
 
                 let (response_body, need_push) = self.handle_command(&command, &body, &content, &remote);
                 // 写回 ACK（同 messageId + code=0）
@@ -1104,7 +1106,7 @@ impl PlaylistChannel {
         .await;
 
         self.inner.clients.lock().await.retain(|(p, _)| p != &peer);
-        eprintln!("[dlna_playlist] client disconnected {remote} result={result:?}");
+        dlog!("[dlna_playlist] client disconnected {remote} result={result:?}");
         result
     }
 
@@ -1124,7 +1126,7 @@ impl PlaylistChannel {
             "GetStatusInfo" => {
                 let si = st.status_info();
                 // 回包内容日志：抖音端断投前最后一次轮询看到的值是退出判定依据
-                eprintln!(
+                dlog!(
                     "[dlna_playlist] GetStatusInfo resp → {}",
                     si.to_string().replace(' ', "")
                 );
@@ -1165,7 +1167,7 @@ impl PlaylistChannel {
             }
             "ClearDramaList" => {
                 st.clear();
-                eprintln!("[dlna_playlist] 手机清空了视频列表");
+                dlog!("[dlna_playlist] 手机清空了视频列表");
                 (response, false)
             }
             "PlayPreDrama" | "PlayNextDrama" => {
@@ -1243,7 +1245,7 @@ impl PlaylistChannel {
             | "SetStretch" | "SetInheritConfig" | "SetSkipInfo" | "PushStatusInfo"
             | "PushRuntimeInfo" | "Heartbeat" => (response, false),
             _ => {
-                eprintln!("[dlna_playlist] 未知命令 {command}（已记录并返回通用确认）");
+                dlog!("[dlna_playlist] 未知命令 {command}（已记录并返回通用确认）");
                 (response, false)
             }
         }
@@ -1289,7 +1291,7 @@ impl PlaylistChannel {
         let name = first_str(&source, &["name", "deviceName"]).unwrap_or_else(|| "未知手机".into());
         let platform = first_str(&source, &["platform"]).unwrap_or_default();
         let package = first_str(&source, &["packageName"]).unwrap_or_default();
-        eprintln!("[dlna_playlist] 发送端={name} ip={remote} platform={platform} package={package}");
+        dlog!("[dlna_playlist] 发送端={name} ip={remote} platform={platform} package={package}");
     }
 }
 

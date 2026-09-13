@@ -3,6 +3,8 @@
 
 use std::sync::Mutex;
 
+use super::media_kind::{self, MediaKind};
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 pub enum TransportState {
@@ -44,6 +46,11 @@ pub struct AvTransport {
     /// 的 dur+1000）都会让客户端自己也判定"播完"并发起第二路切集，与本地切集
     /// 竞态（实测导致抖音退出）。普通 SOAP SetAVTransportURI 到来时清除。
     playlist_mode: Mutex<bool>,
+    /// 当前被投媒体的类型（set_uri 时按 CurrentURI + DIDL-Lite 判定）。
+    /// 前端据此分支渲染：video/audio → 播放器；image → 图片层。
+    /// 判定依据见 media_kind 模块（华为图库「投屏播放」推的是 JPEG，
+    /// 一律走 <video> 必然 error → 业务层自 stop → 手机端看到投屏失败）。
+    media_kind: Mutex<MediaKind>,
 }
 
 #[allow(dead_code)]
@@ -59,6 +66,7 @@ impl AvTransport {
             force_complete_at: Mutex::new(None),
             last_reported: Mutex::new(0),
             playlist_mode: Mutex::new(false),
+            media_kind: Mutex::new(MediaKind::Unknown),
         }
     }
 
@@ -97,6 +105,9 @@ impl AvTransport {
     pub fn set_uri(&self, uri: &str, meta_data: &str) {
         *self.track_uri.lock().unwrap() = uri.to_string();
         *self.track_meta_data.lock().unwrap() = meta_data.to_string();
+        // 媒体类型随换源重判：图片/视频/音频切换 → 前端换渲染分支
+        // （华为图库推 JPEG，与视频同一入口，必须在这里区分）。
+        *self.media_kind.lock().unwrap() = media_kind::detect(uri, meta_data);
         *self.position.lock().unwrap() = 0;
         // 关键：换源时一并清空 duration，避免新集 TrackDuration 短暂残留
         // 上一集时长，与 TrackMetaData 不一致被客户端（抖音）校验丢弃。
@@ -190,6 +201,11 @@ impl AvTransport {
         *self.playlist_mode.lock().unwrap()
     }
 
+    /// 当前被投媒体类型（SetAVTransportURI / 列表换源时刷新）。
+    pub fn media_kind(&self) -> MediaKind {
+        *self.media_kind.lock().unwrap()
+    }
+
     pub fn set_last_reported(&self, ms: u64) {        *self.last_reported.lock().unwrap() = ms;
     }
 
@@ -224,6 +240,7 @@ impl AvTransport {
         *self.state.lock().unwrap() = TransportState::NoMedia;
         *self.track_uri.lock().unwrap() = String::new();
         *self.track_meta_data.lock().unwrap() = String::new();
+        *self.media_kind.lock().unwrap() = MediaKind::Unknown;
         *self.position.lock().unwrap() = 0;
         *self.duration.lock().unwrap() = 0;
         *self.force_complete.lock().unwrap() = false;

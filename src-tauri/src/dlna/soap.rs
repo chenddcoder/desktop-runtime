@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 use crate::dlna::av_transport::AvTransport;
+use crate::dlna::trace::dlog;
 
 /// 强制完成（切集）时 RelTime **超出** TrackDuration 的余量（毫秒）。
 /// 抖音只对"进度超出总时长"（RelTime > TrackDuration）判定播完并切集，
@@ -169,12 +170,24 @@ pub fn handle_action(action: &str, params: &HashMap<String, String>, av: &AvTran
                 // params 值在 parse_soap 时已 decode_html_entities，此处直接保存解码后的
                 // DIDL-Lite XML；GetPositionInfo 需原样回传 TrackMetaData（客户端会校验一致性）。
                 let meta = params.get("CurrentURIMetaData").cloned().unwrap_or_default();
-                eprintln!(
-                    "[dlna_soap_req] SetAVTransportURI metaLen={} metaHead={}",
+                let uri = decode_html_entities(uri);
+                // 媒体类型判定 + 判定依据全量落盘：华为图库推 JPEG 时
+                // （class=object.item.imageItem.photo / mime=image/jpeg）
+                // 必须一眼看出，否则只能看到「投屏失败」无从下手。
+                dlog!(
+                    "[dlna_soap_req] SetAVTransportURI {} metaLen={} uri={}",
+                    crate::dlna::media_kind::describe(&uri, &meta),
                     meta.len(),
-                    meta.chars().take(120).collect::<String>()
+                    uri
                 );
-                av.set_uri(&decode_html_entities(uri), &meta);
+                // 元数据原文（截断）——describe 只给结论，原文用于核对客户端真实声明。
+                if !meta.is_empty() {
+                    dlog!(
+                        "[dlna_soap_req] SetAVTransportURI metaHead={}",
+                        meta.chars().take(240).collect::<String>()
+                    );
+                }
+                av.set_uri(&uri, &meta);
                 // addOn 边界：普通 DLNA 投屏（SetAVTransportURI 路径）**永不进列表模式**，
                 // 显式复位——防止先投过抖音列表（playlist_mode=true）再普通投屏非抖音
                 // 视频时残留列表模式，导致公版也走"如实报告"（污染公版伪装链路）。
@@ -220,7 +233,7 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
                 crate::dlna::av_transport::TransportState::Transitioning => "TRANSITIONING",
                 crate::dlna::av_transport::TransportState::NoMedia => "NO_MEDIA_PRESENT",
             };
-            eprintln!(
+            dlog!(
                 "[dlna_soap_resp] GetTransportInfo -> CurrentTransportState={} pos={}ms dur={}ms",
                 st,
                 av.position(),
@@ -325,7 +338,7 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
             // ⚠️ eprintln 必须打印与 XML 一致的值（rel_time/整秒 TrackDuration）：
             // 之前用 ms_to_hms 打印带小数，日志看着"没生效"但 XML 已是整秒——
             // 判断是否生效以本日志为准。
-            eprintln!(
+            dlog!(
                 "[dlna_soap_resp] GetPositionInfo -> RelTime={rel_time} TrackDuration={} (pos={pos}ms realDur={dur}ms fake_short={fake_short} is_douyin={is_douyin_source} force_complete={} playlist_mode={playlist_mode}) TrackURI={uri:?} TrackMetaData.len={}",
                 ms_to_hms_whole(reported_dur),
                 av.force_complete(),
