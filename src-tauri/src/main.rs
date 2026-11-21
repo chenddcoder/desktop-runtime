@@ -4,9 +4,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod dlna;
+pub mod endpoint;
 pub mod http_download;
 pub mod media_proxy;
+// 手机手柄 UDP 5991 —— 补 Android 侧 PadModule（桌面壳没有插件）
+pub mod pad;
 pub mod proxy;
+pub mod webdav;
 
 use tauri::{
     Emitter, LogicalPosition, LogicalSize, WebviewUrl, WebviewWindowBuilder, WindowEvent,
@@ -73,6 +77,12 @@ const UI_SCALE_JS: &str = include_str!("../ui_scale.js");
 const DLNA_OVERLAY_JS: &str = include_str!("../dlna_overlay.js");
 // 投屏「扫码看广告解锁」叠层：经 initialization_script 注入，不改 web-runtime 本体。
 const AD_UNLOCK_JS: &str = include_str!("../ad_unlock_overlay.js");
+// ⛔ 不要再注入 `app_launcher.js`（文件保留作参考）。
+//    2026-11-09 实测：投屏显象（esapp-tvcast）**本身就是启动器** —— 首页左侧有
+//    「首页 / 全部应用 / 游戏中心 / 设置」，页面里直接列 `/api/runtime/catalog` 的应用磁贴，
+//    点击走 `nativeRouter.push({pkg})` → `EsNativeModule.launchEsPage`（web-renderer 已实现
+//    跨应用 resolve/下载/重载）。再加一个左上四宫格 = 第二个入口，正是要治的那种割裂。
+//    要加新应用到桌面端，正确做法是**上传到后台**（web_runtime_package），磁贴自动出现。
 // 投屏诊断注入（可选，devtools.json 的 "diagnostics": true 开启；默认不注入）：
 // 捕获 video error / console / 未处理异常 / video 事件时间线，经 dlna_debug_log 打回
 // Rust 日志文件，并渲染常驻诊断面板 + 错误红条。排查 release webview 侧问题时开启。
@@ -121,21 +131,42 @@ const ANTI_TAMPER_JS: &str = r#"
 const ES_APP_CONFIG_JSON: &str = include_str!("../es-app.config.json");
 
 /// 解析默认快应用配置；字段缺失时兜底 tvcast（投屏显象）。
+///
+/// 优先级：**环境变量 > 编译期 es-app.config.json > 内置默认**。
+/// 加环境变量这条是为了「一份二进制跑任意快应用」：
+///   验收时 `ES_APP_PKG=es.com.nes.tv ./quickapp-desktop` 就能直接拉卡带机，
+///   不用改配置文件再重新编译（include_str! 是编译期的，改完必须 rebuild）。
 fn es_app_config() -> (String, String) {
     let (pkg_default, name_default) = ("cn.chenddcoder.tvcast".to_string(), "投屏显象".to_string());
+    let env_of = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
     let v: serde_json::Value =
         serde_json::from_str(ES_APP_CONFIG_JSON).unwrap_or(serde_json::Value::Null);
-    let pkg = v
-        .get("esPackage")
-        .and_then(|x| x.as_str())
-        .map(String::from)
+    let pkg = env_of("ES_APP_PKG")
+        .or_else(|| {
+            v.get("esPackage")
+                .and_then(|x| x.as_str())
+                .map(String::from)
+        })
         .unwrap_or(pkg_default);
-    let name = v
-        .get("appName")
-        .and_then(|x| x.as_str())
-        .map(String::from)
+    let name = env_of("ES_APP_NAME")
+        .or_else(|| v.get("appName").and_then(|x| x.as_str()).map(String::from))
         .unwrap_or(name_default);
     (pkg, name)
+}
+
+/// 退出桌面壳（快应用里按「返回」时调用）。
+///
+/// WKWebView 不支持 `window.close()`，窗口关不掉就必须回到 Rust 侧。
+/// 页脚写着「返回 退出」，没有这条命令就是一个点不动的死按钮。
+#[tauri::command]
+fn app_exit(app: tauri::AppHandle) {
+    dlog!("[desktop-runtime] app_exit");
+    app.exit(0);
 }
 
 fn main() {
@@ -163,6 +194,24 @@ fn main() {
                 serde_json::to_string(&es_pkg).unwrap_or_else(|_| "\"cn.chenddcoder.tvcast\"".into())
             );
             dlog!("[desktop-runtime] default es_pkg={es_pkg} appName={app_name}");
+            /*
+             * resolve 基址注入（**必须**，否则桌面端 es_pkg 拉包必失败）。
+             *
+             * web-runtime 的 index.html 会用 `location.origin` 拼 resolve 地址，而 Tauri 的
+             * origin 是 `tauri://localhost` —— 不是 http(s)，也没有后端，
+             * 结果是「本地无缓存且服务器解析失败」，只能靠上次的 IndexedDB 缓存苟活。
+             *
+             * 为什么用 defineProperty 锁死而不是直接赋值：
+             * index.html 的内联脚本**无条件**重写 `window.__CROSS_APP_RESOLVER_BASE__`，
+             * 早一步赋值会被它覆盖。锁 setter（no-op）+ getter 恒返回自建后端最稳。
+             * 这段跑在 document-start，早于 index.html 的任何脚本。
+             */
+            let resolver_js = concat!(
+                "(function(){try{",
+                "Object.defineProperty(window,'__CROSS_APP_RESOLVER_BASE__',{configurable:true,",
+                "get:function(){return 'https://www.chenddcoder.cn'},set:function(){}});",
+                "}catch(e){window.__CROSS_APP_RESOLVER_BASE__='https://www.chenddcoder.cn';}})();"
+            );
             // 版本号注入：读 tauri.conf.json 的 version（package_info()），替换 overlay 脚本占位符，
             // 由 dlna_overlay.js 在右下角渲染版本角标（避免 webview 侧再走 Tauri API 权限）
             let app_version = app.package_info().version.to_string();
@@ -179,6 +228,7 @@ fn main() {
                 .initialization_script(&dlna_overlay_js)
                 .initialization_script(AD_UNLOCK_JS)
                 .initialization_script(&es_pkg_js)
+                .initialization_script(resolver_js)
                 .initialization_script(UI_SCALE_JS);
             // 调试 HUD 仅 DEBUG 构建注入（release 不注入，发布版无调试浮层）。
             #[cfg(debug_assertions)]
@@ -341,6 +391,7 @@ fn main() {
         })
         .manage(http_download::DownloadState::default())
         .invoke_handler(tauri::generate_handler![
+            app_exit,
             dlna::dlna_start,
             dlna::dlna_stop,
             dlna::dlna_status,
@@ -352,7 +403,25 @@ fn main() {
             proxy::proxy_http,
             http_download::http_download_open,
             http_download::http_download_read,
-            http_download::http_download_close
+            http_download::http_download_close,
+            // 桌面端 WebDAV 服务（快应用投屏收包的 PC 实现）+ 落盘文件读取
+            webdav::webdav_start,
+            webdav::webdav_stop,
+            webdav::webdav_info,
+            webdav::es_read_file_base64,
+            webdav::es_list_files,
+            // 桌面端「自起 HTTP 服务」：补 Android 插件 com.quicktvui.plugin.endpoint
+            // （留言板 host 模式 / 大屏接手机，缺了它桌面端永远离线且没有二维码）
+            endpoint::endpoint_start,
+            endpoint::endpoint_stop,
+            endpoint::endpoint_info,
+            endpoint::endpoint_reply,
+            // 手机手柄 UDP 5991：VES 快应用的 PadModule 在桌面端的等价物（协议完全一致）
+            pad::pad_start,
+            pad::pad_stats,
+            pad::pad_target,
+            pad::pad_stop,
+            pad::pad_reset
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

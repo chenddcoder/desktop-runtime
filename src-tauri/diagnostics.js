@@ -178,7 +178,9 @@
     try {
       var args = Array.prototype.slice.call(arguments);
       var line = args.map(jsonish).join(' ').slice(0, 1200);
-      if (/IJKPlayer|HLS|hls\.js|m3u8|casting|AutoProxy|tauriEnv|es3-video-player/i.test(line)) {
+      // 2026-11-09 加：web-runtime 装载链路（resolve / 下载 / 解压 / 入口 / 挂载）也走 console.log，
+      // 排查「快应用黑屏但一个错误都没有」时必须能看到它走到哪一步，否则只能靠猜。
+      if (/IJKPlayer|HLS|hls\.js|m3u8|casting|AutoProxy|tauriEnv|es3-video-player|Web Runtime|es_pkg|resolve|bundle|appRegister|Entry|下载|解压|挂载|mount/i.test(line)) {
         reportDiag('console.log', line);
       }
     } catch (e) {}
@@ -222,6 +224,47 @@
     var r = e && e.reason;
     reportDiag('unhandledrejection', jsonish(r && (r.message || r)).slice(0, 500));
   });
+
+  // ===== DOM 就绪度快照（只在状态变化时上报，避免刷日志） =====
+  // 为什么需要：快应用黑屏但 console 一条错误都没有时，「谁挡住了谁」只能靠 DOM 事实判断 ——
+  // splash 还在不在、#app 有没有子节点、canvas 是不是 0 尺寸。截图看不出这些。
+  (function () {
+    var last = '';
+    function snap() {
+      try {
+        var app = document.getElementById('app');
+        var sp = document.getElementById('quickapp-splash');
+        var cs = sp ? getComputedStyle(sp) : null;
+        var canvases = document.querySelectorAll('canvas');
+        var dims = [];
+        for (var i = 0; i < canvases.length && i < 4; i++) {
+          var c = canvases[i];
+          var r = c.getBoundingClientRect();
+          dims.push(Math.round(r.width) + 'x' + Math.round(r.height) +
+            (c.width && c.height ? '@' + c.width + 'x' + c.height : '@0x0'));
+        }
+        var body = document.body;
+        var bcs = body ? getComputedStyle(body) : null;
+        var s = 'app.children=' + (app ? app.children.length : -1) +
+          ' app.rect=' + (app ? Math.round(app.getBoundingClientRect().width) + 'x' + Math.round(app.getBoundingClientRect().height) : '-') +
+          ' canvases=' + canvases.length + '[' + dims.join(',') + ']' +
+          ' splash.cls=' + (sp ? sp.className : '-') +
+          ' splash.display=' + (cs ? cs.display : '-') +
+          ' splash.opacity=' + (cs ? cs.opacity : '-') +
+          ' splash.bg=' + (cs ? cs.backgroundColor : '-') +
+          ' body.bg=' + (bcs ? bcs.backgroundColor : '-') +
+          ' htmlLen=' + (body ? body.innerHTML.length : -1) +
+          ' focusMgr=' + (window.__TV_FOCUS_MANAGER__ ? 'Y' : 'N') +
+          ' href=' + String(location.href).slice(-110);
+        if (s !== last) {
+          last = s;
+          reportDiag('dom-snap', s);
+        }
+      } catch (e) {}
+    }
+    setInterval(snap, 1500);
+    setTimeout(snap, 300);
+  })();
 
   // ===== 常驻诊断面板（右上角可折叠） =====
   (function () {

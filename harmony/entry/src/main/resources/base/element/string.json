@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "投屏显象鸿蒙运行时"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "投屏显象"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "投屏显象"
+    },
+    {
+      "name": "reason_internet",
+      "value": "加载快应用与访问局域网投屏服务"
+    },
+    {
+      "name": "reason_network_info",
+      "value": "读取局域网地址以建立投屏与手柄通道"
+    }
+  ]
+}

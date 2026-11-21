@@ -1,0 +1,46 @@
+{
+  "app": {
+    // 签名：默认留空（出 unsigned HAP）。
+    // scripts/build-hap.sh 检测到 ~/.ohos/config 里有匹配 bundleName 的 p7b 时自动注入。
+    "signingConfigs": [],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "targetSdkVersion": "6.1.1(24)",
+        // 最低支持 5.0.5(17)：本机三台模拟器（TV=19 / 2in1=17 / Mate X5=21）都在这个范围以上，
+        // 而市面主流真机仍是 5.x。若设成 24，只有 HarmonyOS 6.1+ 能装，模拟器一个都跑不起来。
+        "compatibleSdkVersion": "5.0.5(17)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug"
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

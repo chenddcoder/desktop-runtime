@@ -85,7 +85,7 @@ bump_version() {
 # ============ 1. web-runtime 构建 ============
 build_web() {
   [[ "$DO_WEB" != 1 || "$SKIP_WEB" == 1 ]] && return
-  log "构建 web-runtime dist（mode=$WEB_MODE）"
+  log "构建 web-runtime dist (mode=${WEB_MODE})"
   [[ -d "$WEB_RUNTIME_DIR" ]] || die "web-runtime 目录不存在: $WEB_RUNTIME_DIR"
   cd "$WEB_RUNTIME_DIR"
   npm run "$WEB_MODE" >/dev/null

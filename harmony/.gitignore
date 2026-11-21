@@ -1,0 +1,18 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+/.preview
+
+# Rust 桥产物（由 scripts/build-hap.sh 生成，勿手工提交）
+/entry/libs/arm64-v8a/*.so
+
+.DS_Store

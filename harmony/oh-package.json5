@@ -1,0 +1,6 @@
+{
+  "modelVersion": "6.1.1",
+  "description": "投屏显象鸿蒙运行时（desktop-runtime 的 ArkWeb 壳）",
+  "dependencies": {},
+  "devDependencies": {}
+}

@@ -1,0 +1,9 @@
+{
+  "name": "libquickapp_bridge.so",
+  "version": "0.1.0",
+  "description": "投屏显象鸿蒙 Rust 桥（desktop-runtime 原生能力的 NAPI 版本）",
+  "main": "",
+  "types": "./index.d.ts",
+  "author": "chendd",
+  "license": "Apache-2.0"
+}

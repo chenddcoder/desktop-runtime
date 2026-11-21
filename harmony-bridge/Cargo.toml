@@ -1,0 +1,27 @@
+[package]
+name = "harmony_bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "投屏显象鸿蒙壳的 Rust 桥：把 desktop-runtime 的原生能力以 NAPI 形式暴露给 ArkTS"
+
+[lib]
+name = "quickapp_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+napi-derive-ohos = "1.2.0"
+napi-ohos = "1.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+
+[build-dependencies]
+napi-build-ohos = "1.2.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

@@ -19,7 +19,7 @@ use crate::dlna::trace::dlog;
 // 判定进度异常忽略、不切集。1ms 保证：① pos 严格 > dur（整秒时长如 427000ms
 // 时 pos=427001 → RelTime=00:00:07.001 仍带小数、严格超出，==dur 会被判为
 // 未超出而不切）；② 超出量毫秒级，落在 iPhone 接受的"略超总时长"区间。
-const FORCE_COMPLETE_OVERSHOOT_MS: u64 = 0;
+const FORCE_COMPLETE_OVERSHOOT_MS: u64 = 1;
 
 /// 动作处理的结果：携带需要广播给前端的控制意图。
 /// 之前只有 Play 会 emit 事件，Seek/Stop/Pause 被当成 StateChanged 静默吞掉，
@@ -290,10 +290,12 @@ pub fn response_params(action: &str, av: &AvTransport) -> HashMap<String, String
                 }
                 if av.force_complete() || pos >= dur {
                     // 按下切集 / 自然播完 → 返回超出虚拟时长的进度（6s+1s=7s）。
-                    // 短视频必须"超出 1s"（安卓抖音实测 ==6s 不切、7s 切）——
-                    // 不随 FORCE_COMPLETE_OVERSHOOT_MS（1ms）走，否则 6.001s
-                    // 对抖音整数秒截断判定可能退化回 ==6s。
-                    pos = reported_dur + FORCE_COMPLETE_OVERSHOOT_MS;
+                    // ⛔ 这里**必须硬编码 1000**，不能跟 FORCE_COMPLETE_OVERSHOOT_MS(1ms) 走：
+                    //   安卓抖音对进度按整数秒截断判定，6.001s 会被截成 6s，
+                    //   于是退化成 `==TrackDuration`（实测 ==6s 不切集、7s 才切）。
+                    //   OVERSHOOT=1ms 是给"普通长视频 + iPhone 接受毫秒级略超"用的，
+                    //   两套判定口径不同，不能共用一个常量。
+                    pos = reported_dur + 1000;
                 }
                 // 其余情况（播放中）：保留真实进度（<6s）
             } else if !playlist_mode && av.force_complete() && dur > 0 {
