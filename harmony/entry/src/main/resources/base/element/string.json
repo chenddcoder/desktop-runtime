@@ -2,15 +2,15 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "投屏显象鸿蒙运行时"
+      "value": "投屏小站鸿蒙运行时"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "投屏显象"
+      "value": "投屏小站"
     },
     {
       "name": "EntryAbility_label",
-      "value": "投屏显象"
+      "value": "投屏小站"
     },
     {
       "name": "reason_internet",

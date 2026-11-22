@@ -18,3 +18,8 @@ Thumbs.db
 test
 target-check
 .verify*
+
+# HarmonyOS 构建产物与 IDE 本地缓存
+harmony-bridge/target/
+harmony/.bitfun/
+harmony/entry/build/

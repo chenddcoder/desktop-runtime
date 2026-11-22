@@ -1,6 +1,8 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { NapiBridge } from './NapiBridge';
 import { proxyHttp } from './ProxyHttp';
+import { httpDownloadClose, httpDownloadOpen, httpDownloadRead } from './HttpDownload';
+import { EndpointServer } from './EndpointServer';
 import { PadStats, PadUdp } from './PadUdp';
 
 const DOMAIN = 0x0000;
@@ -88,11 +90,18 @@ function portOf(argsJson: string): number {
  */
 export class InvokeRouter {
   private pad: PadUdp;
+  /** 局域网自起 HTTP 服务（留言板 host 模式）：桌面端 endpoint.rs 的鸿蒙等价物 */
+  private endpoint: EndpointServer = new EndpointServer();
   /** 退出应用（由页面注入，ArkTS 里要用 UIAbilityContext.terminateSelf） */
   onExit: () => void = () => {};
 
   constructor(pad: PadUdp) {
     this.pad = pad;
+  }
+
+  /** 页面侧事件出口（endpoint://request 等），由 Index 注入 runJavaScript */
+  setHostEmit(fn: (name: string, payloadJson: string) => void): void {
+    this.endpoint.emit = fn;
   }
 
   async invoke(cmd: string, argsJson: string): Promise<InvokeResult> {
@@ -156,27 +165,56 @@ export class InvokeRouter {
       case 'pad_reset':
         return ok(JSON.stringify(this.pad.reset()));
 
-      /* ---------------- 尚未实现 ---------------- */
+      /* ---------------- DLNA 投屏接收（DMR，Rust 桥） ---------------- */
+      // SSDP 用 MulticastSocket 语义（Rust 侧 socket2 join），只需 INTERNET 权限；
+      // 事件（dlna://play 等）走 host 队列 + bridge_poll，与桌面端一致。
       case 'dlna_start':
+        return fromRust(NapiBridge.dlnaStart(argsJson));
       case 'dlna_stop':
+        return fromRust(NapiBridge.dlnaStop());
       case 'dlna_status':
+        return fromRust(NapiBridge.dlnaStatus());
       case 'dlna_report_position':
+        return fromRust(NapiBridge.dlnaReportPosition(argsJson));
       case 'dlna_send_remote_event':
+        return fromRust(NapiBridge.dlnaSendRemoteEvent(argsJson));
       case 'dlna_debug_log':
+        return fromRust(NapiBridge.dlnaDebugLog(argsJson));
       case 'get_dlna_name':
+      case 'ProcessBridgeModule.getDlnaName':
+        return ok(NapiBridge.dlnaGetName());
       case 'set_dlna_name':
-        // SSDP 要 `ohos.permission.MULTICAST`（system_basic，普通应用申请不到）⇒ 暂不可用
-        hilog.warn(DOMAIN, TAG, 'dlna not supported on harmony: %{public}s', cmd);
-        return fail('__unsupported__:dlna（鸿蒙普通应用拿不到 MULTICAST 权限）');
+      case 'ProcessBridgeModule.setDlnaName':
+        return fromRust(NapiBridge.dlnaSetName(argsJson));
       case 'endpoint_start':
+        try {
+          return ok(await this.endpoint.start(argsJson));
+        } catch (e) {
+          const err = e as Error;
+          return fail(err.message);
+        }
       case 'endpoint_stop':
+        return ok(JSON.stringify(this.endpoint.stop()));
       case 'endpoint_info':
+        return ok(this.endpoint.infoJson());
       case 'endpoint_reply':
-        return fail(`__unsupported__:${cmd}（endpoint 服务端尚未移植）`);
+        return ok(JSON.stringify(this.endpoint.reply(argsJson)));
       case 'http_download_open':
+        try {
+          return ok(await httpDownloadOpen(argsJson));
+        } catch (e) {
+          const err = e as Error;
+          return fail(err.message);
+        }
       case 'http_download_read':
+        try {
+          return ok(httpDownloadRead(argsJson));
+        } catch (e) {
+          const err = e as Error;
+          return fail(err.message);
+        }
       case 'http_download_close':
-        return fail(`__unsupported__:${cmd}（流式下载尚未移植）`);
+        return ok(httpDownloadClose(argsJson));
 
       default:
         hilog.warn(DOMAIN, TAG, 'command not implemented: %{public}s', cmd);

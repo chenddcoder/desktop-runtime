@@ -203,6 +203,9 @@ build_rust_bridge() {
   export OHOS_NDK_HOME="$ndk"
 
   export PATH="$HOME/.cargo/bin:$PATH"
+  # NAPI 模块名必须是 ArkTS import 的那个（libquickapp_bridge.so → quickapp_bridge），
+  # 否则 requireNapi 拿到的模块是 undefined，全桥报 "not callable"。
+  export NAPI_BUILD_TARGET_NAME=quickapp_bridge
   # rustc 对 aarch64-unknown-linux-ohos 不知道用哪个链接器，必须显式指到 NDK 的 clang 包装
   export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER="$ndk/llvm/bin/aarch64-unknown-linux-ohos-clang"
   export CARGO_TARGET_DIR="$HOME/.quickapp-bridge-target"

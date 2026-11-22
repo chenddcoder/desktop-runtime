@@ -22,6 +22,33 @@ export const TAURI_SHIM_JS: string = `
   var listeners = {};
   var pendingEarly = [];
 
+  /**
+   * 宿主侧的界面取舍：整块隐藏 web-runtime 的调试面板（上传 ZIP / 清除 / 强制刷新），
+   * 不是收起，是连标题条一起不渲染。改在宿主注入，web-runtime 本体一行不动。
+   * 需要调试时在启动 URL 上加 debug=1。
+   */
+  function applyHostChrome() {
+    var debug = false;
+    try {
+      debug = new URLSearchParams(window.location.search).get('debug') === '1';
+    } catch (e) {}
+    if (debug) return;
+    var css = '#controls-panel{display:none !important}';
+    var style = document.createElement('style');
+    style.textContent = css;
+    var parent = document.head || document.documentElement;
+    if (parent) {
+      parent.appendChild(style);
+    } else {
+      // document-start 极早期可能还没有根节点，退到 DOMContentLoaded 补一次
+      document.addEventListener('DOMContentLoaded', function () {
+        var p = document.head || document.documentElement;
+        if (p) p.appendChild(style);
+      });
+    }
+  }
+  applyHostChrome();
+
   function bridgeReady() {
     return window.__ohosBridge && typeof window.__ohosBridge.call === 'function';
   }
