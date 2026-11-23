@@ -5,7 +5,10 @@ import { common } from '@kit.AbilityKit';
 import { InvokeRouter } from '../bridge/InvokeRouter';
 import { NapiBridge } from '../bridge/NapiBridge';
 import { PadUdp } from '../bridge/PadUdp';
+import { resolveLanIp } from '../bridge/NetInfo';
 import { TAURI_SHIM_JS } from '../bridge/TauriShim';
+import { DLNA_OVERLAY_JS } from '../bridge/DlnaOverlay';
+import { WEB_SCALE_JS } from '../bridge/WebScale';
 
 const DOMAIN = 0x0000;
 const TAG = 'ToupingPage';
@@ -31,6 +34,17 @@ const WEB_ORIGIN = 'https://appassets.local';
  */
 const RESOLVER_BASE = 'https://runtime.chenddcoder.cn';
 
+/**
+ * 启动即进入「投屏显象」快应用，与桌面端 `src-tauri/es-app.config.json` 的
+ * `esPackage` 保持一致。不带 es_pkg 时会停在 web-runtime 的应用目录页。
+ *
+ * 调试面板（上传 ZIP / 强制刷新）由 `TauriShim` 注入 CSS 整块隐藏，不看收起条；
+ * 需要它时在启动 URL 上加 `debug=1`。
+ */
+const ES_PKG = 'cn.chenddcoder.tvcast';
+
+const START_QUERY = `resolver=${RESOLVER_BASE}&es_pkg=${ES_PKG}`;
+
 /** Rust 事件队列的拉取间隔。落盘通知这类一次性事件，80ms 抖动无所谓。 */
 const EVENT_POLL_MS = 80;
 
@@ -50,6 +64,10 @@ struct Index {
   private pad: PadUdp = new PadUdp();
   private router: InvokeRouter = new InvokeRouter(this.pad);
   private pumpTimer: number = -1;
+  /** onAreaChange 是逐帧触发的，节流后再通知页面重算 */
+  private resizeTimer: number = -1;
+  /** 启动时解析一次本机局域网 IP，DLNA 与定时器共用同一个结果 */
+  private lanIp: Promise<string> = Promise.resolve('');
 
   aboutToAppear(): void {
     this.bridge.handler = (id: string, cmd: string, args: string) => {
@@ -61,6 +79,11 @@ struct Index {
       ctx.terminateSelf();
     };
 
+    // endpoint 服务收到的请求要原样交给页面算（留言板 host 模式），与手柄事件同一条下行通道
+    this.router.setHostEmit((name: string, payloadJson: string) => {
+      this.runJs('window.__tauriHostEmit(' + JSON.stringify(name) + ',' + JSON.stringify(payloadJson) + ')');
+    });
+
     // 手柄按键：桌面端是 Rust 收包后 emit；鸿蒙侧由 ArkTS 直收再推事件（见 PadUdp.ets 顶部）
     this.pad.emit = (name: string, payloadJson: string) => {
       this.runJs('window.__tauriHostEmit(' + JSON.stringify(name) + ',' + JSON.stringify(payloadJson) + ')');
@@ -71,6 +94,33 @@ struct Index {
     const setRoot = NapiBridge.setRoot(ctx.filesDir);
     hilog.info(DOMAIN, TAG, 'webdav root: %{public}s', setRoot);
 
+    // DLNA 的日志/设备名配置也落在沙箱里；桌面端在 setup 阶段就拉起 DMR(5001)，
+    // 这里等首帧后再起，避免 bind 端口/建 tokio 任务拖慢启动。
+    hilog.info(DOMAIN, TAG, 'dlna root: %{public}s', NapiBridge.dlnaSetRoot(ctx.filesDir));
+
+    // 本机局域网 IP 尽早解析并喂给 Rust：鸿蒙沙箱里 getifaddrs 常只回环，Rust 拿不到
+    // 真实网卡时设备名会退化成「投屏显象_00.00」、SSDP 也 join 不上组，手机搜不到本机。
+    // 页面可能在 dlnaStart 之前就调 get_dlna_name 拿标题，所以这里不能等定时器。
+    // 只是 hint：Rust 自己枚举成功时仍以内核结果为准。
+    this.lanIp = resolveLanIp();
+    this.lanIp.then((ip: string) => {
+      if (ip) {
+        hilog.info(DOMAIN, TAG, 'dlna local ip: %{public}s', NapiBridge.dlnaSetLocalIp(ip));
+      } else {
+        hilog.warn(DOMAIN, TAG, 'lan ip unresolved, fall back to getifaddrs');
+      }
+    }).catch((e: BusinessError) => {
+      hilog.warn(DOMAIN, TAG, 'resolveLanIp failed: %{public}s', e.message);
+    });
+
+    setTimeout(() => {
+      // 等 IP 落定再起 DMR，保证设备名/SSDP LOCATION 一次就是对的
+      this.lanIp.then(() => {
+        const r = NapiBridge.dlnaStart('{"port":5001}');
+        hilog.info(DOMAIN, TAG, 'dlna_start: %{public}s', r);
+      });
+    }, 1200);
+
     this.startEventPump();
   }
 
@@ -79,18 +129,48 @@ struct Index {
       clearInterval(this.pumpTimer);
       this.pumpTimer = -1;
     }
+    if (this.resizeTimer >= 0) {
+      clearTimeout(this.resizeTimer);
+      this.resizeTimer = -1;
+    }
     this.pad.stop();
+  }
+
+  /** Web 组件区域变化 → 节流通知页面派发 resize，WebScale 会在回调里重算铺满比例 */
+  private scheduleResizeNotify(): void {
+    if (this.resizeTimer >= 0) {
+      return;
+    }
+    this.resizeTimer = setTimeout(() => {
+      this.resizeTimer = -1;
+      this.runJs('window.dispatchEvent(new Event("resize"))');
+    }, 80);
   }
 
   build() {
     Stack() {
-      Web({ src: `${WEB_ORIGIN}/index.html?resolver=${RESOLVER_BASE}`, controller: this.controller })
+      Web({ src: `${WEB_ORIGIN}/index.html?${START_QUERY}`, controller: this.controller })
         .javaScriptAccess(true)
         .domStorageAccess(true)
         .fileAccess(false)
         .imageAccess(true)
         .zoomAccess(false)
         .multiWindowAccess(false)
+        /*
+         * 放行 https 页面里的 http 资源。
+         *
+         * 页面自己的 origin 是 https://appassets.local（onInterceptRequest 虚拟域），而手机
+         * 推过来的媒体地址是 http://192.168.x.x:port/xxx —— 默认混合内容策略会把这类
+         * 子资源直接拦掉，表现是：手机显示投屏成功、电视端 video 报错、画面永远不出来。
+         */
+        .mixedMode(MixedMode.All)
+        /*
+         * 关掉「必须用户手势才能播放」。
+         *
+         * 投屏是程序化调 play()，电视遥控器没有任何点击动作；默认策略下 <video> 会被
+         * 静音/挂起，手机端 GetTransportInfo 一直是 STOPPED。
+         */
+        .mediaPlayGestureAccess(false)
         .horizontalScrollBarAccess(false)
         .verticalScrollBarAccess(false)
         .javaScriptProxy({
@@ -99,7 +179,14 @@ struct Index {
           methodList: ['call'],
           controller: this.controller
         })
-        .javaScriptOnDocumentStart([{ script: TAURI_SHIM_JS, scriptRules: ['*'] }])
+        // 顺序有意义：先把 __TAURI__ 补出来，再挂 DLNA → 快应用的事件桥。
+        // 少了第二段，手机会显示"投屏成功"而电视端毫无反应（事件没有监听者）。
+        // WEB_SCALE_JS 负责让 1920x1080 舞台跟窗口尺寸走（内置 scaleApp 缓存了首次视口）。
+        .javaScriptOnDocumentStart([
+          { script: WEB_SCALE_JS, scriptRules: ['*'] },
+          { script: TAURI_SHIM_JS, scriptRules: ['*'] },
+          { script: DLNA_OVERLAY_JS, scriptRules: ['*'] }
+        ])
         .onInterceptRequest((event) => this.intercept(event))
         .onConsole((event) => {
           hilog.info(DOMAIN, TAG, '[web] %{public}s', event.message.getMessage());
@@ -112,6 +199,11 @@ struct Index {
           hilog.error(DOMAIN, TAG, 'resource error: %{public}s %{public}s',
             event.request.getRequestUrl(), event.error.getErrorInfo());
         })
+        /*
+         * 窗口被拉大/拉小时，ArkWeb 的视口更新是异步的，某些版本不会派发 DOM resize。
+         * 这里在组件区域变化后主动通知一次，让 WebScale 注入脚本重算缩放，避免画面停在旧尺寸。
+         */
+        .onAreaChange(() => this.scheduleResizeNotify())
         .width('100%')
         .height('100%')
     }

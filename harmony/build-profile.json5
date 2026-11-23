@@ -1,15 +1,25 @@
 {
   "app": {
-    // 签名：默认留空（出 unsigned HAP）。
-    // scripts/build-hap.sh 检测到 ~/.ohos/config 里有匹配 bundleName 的 p7b 时自动注入。
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "/storage/Users/currentUser/.ohos/config/default_harmony_dheknT6fH2mpQAtj2rM7QxhVFoWplSHb0IEwOyI=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001b56533df9a3987038b574691f72304b74ffefa6d948d57000c2aeda6b22daf0cede59417e46ab49",
+          "profile": "/storage/Users/currentUser/.ohos/config/default_harmony_dheknT6fH2mpQAtj2rM7QxhVFoWplSHb0IEwOyI=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "/storage/Users/currentUser/.ohos/config/default_harmony_dheknT6fH2mpQAtj2rM7QxhVFoWplSHb0IEwOyI=.p12",
+          "storePassword": "0000001b56533df9a3987038b574691f72304b74ffefa6d948d57000c2aeda6b22daf0cede59417e46ab49"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",
         "signingConfig": "default",
         "targetSdkVersion": "6.1.1(24)",
-        // 最低支持 5.0.5(17)：本机三台模拟器（TV=19 / 2in1=17 / Mate X5=21）都在这个范围以上，
-        // 而市面主流真机仍是 5.x。若设成 24，只有 HarmonyOS 6.1+ 能装，模拟器一个都跑不起来。
         "compatibleSdkVersion": "5.0.5(17)",
         "runtimeOS": "HarmonyOS",
         "buildOption": {

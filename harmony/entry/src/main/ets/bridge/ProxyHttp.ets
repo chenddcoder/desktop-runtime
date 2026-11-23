@@ -18,11 +18,27 @@ const TAG = 'ToupingProxy';
  * ⛔ SSRF 兜底同样要留：拒绝私有/本地网段，不做开放代理。
  */
 
+/**
+ * 入参是 Tauri 的调用形态：`invoke('proxy_http', { req: {...} })`，
+ * 字段名沿用 Rust 的 serde：`body_base64`（snake_case）。
+ * 直接传 `{url,...}` 的旧调用也兼容，避免前端两条路径行为不一致。
+ */
 interface ProxyReq {
   url: string;
   method: string;
   headers: Record<string, string>;
   bodyBase64?: string;
+  body_base64?: string;
+}
+
+interface ProxyArgs {
+  req?: ProxyReq;
+  // 兼容直接传 `{url, method, headers, bodyBase64}` 的旧调用
+  url?: string;
+  method?: string;
+  headers?: Record<string, string>;
+  bodyBase64?: string;
+  body_base64?: string;
 }
 
 interface ProxyResp {
@@ -120,8 +136,9 @@ function headersToRecord(raw: Object | undefined): Record<string, string> {
  * 任何失败都抛 Error，由 InvokeRouter 转成 invoke 的 reject。
  */
 export async function proxyHttp(argsJson: string): Promise<string> {
-  const req = JSON.parse(argsJson) as ProxyReq;
-  const url = String(req.url || '');
+  const parsed = JSON.parse(argsJson) as ProxyArgs;
+  const inner: ProxyReq | undefined = parsed.req;
+  const url = String((inner ? inner.url : parsed.url) || '');
   if (!url) {
     throw new Error('proxy_http: url is empty');
   }
@@ -130,10 +147,10 @@ export async function proxyHttp(argsJson: string): Promise<string> {
     throw new Error(`proxy blocked: private/internal host not allowed: ${url}`);
   }
 
-  // ⛔ 裸 `{}` 会被 ArkTS 判成 untyped object literal，必须显式标注类型
-  const headerOut: Record<string, string> = req.headers ? req.headers : {};
+  const rawHeaders: Object | undefined = inner ? inner.headers : parsed.headers;
+  const headerOut: Record<string, string> = headersToRecord(rawHeaders);
   const options: http.HttpRequestOptions = {
-    method: methodOf(String(req.method || 'GET')),
+    method: methodOf(String((inner ? inner.method : parsed.method) || 'GET')),
     header: headerOut,
     expectDataType: http.HttpDataType.ARRAY_BUFFER,
     connectTimeout: 15000,
@@ -141,11 +158,18 @@ export async function proxyHttp(argsJson: string): Promise<string> {
     usingCache: false
   };
 
-  if (req.bodyBase64) {
+  // 前端按 Rust 字段名传 body_base64；驼峰是历史写法，两者都认
+  const camel: string | undefined = inner ? inner.bodyBase64 : parsed.bodyBase64;
+  const snake: string | undefined = inner ? inner.body_base64 : parsed.body_base64;
+  const bodyB64: string = camel ? camel : (snake ? snake : '');
+  if (bodyB64) {
     const helper = new util.Base64Helper();
-    const bytes = helper.decodeSync(req.bodyBase64);
+    const bytes = helper.decodeSync(bodyB64);
     // ArrayBuffer 是 http 模块唯一能「原样上传」的二进制形态（string 会被当表单文本）
-    options.extraData = bytes.buffer as ArrayBuffer;
+    options.extraData = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength
+    ) as ArrayBuffer;
   }
 
   const client = http.createHttp();

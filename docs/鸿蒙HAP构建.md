@@ -131,9 +131,9 @@ $HDC shell hilog -T ToupingNapi
 | `webdav_start/stop/info` | ✅ | Rust `webdav.rs`（移植） | 落盘根由 ArkTS 用 `context.filesDir` 传入 |
 | `es_read_file_base64` / `es_list_files` | ✅ | Rust `webdav.rs`（移植） | 越界读仍被 `canonicalize` 拦住 |
 | `pad_start/stats/target/stop/reset` | ✅ | ArkTS `PadUdp.ets`（UDP 5991） | 60Hz 按键不能走轮询，改 ArkTS 直收直推 |
-| `endpoint_*` | ⛔ | — | 无前端消费方（`messageboard-tv` 走的是原生插件 `EndpointModule`），先不写死代码 |
-| `http_download_*` | ⛔ | — | 流式下载要 reqwest+TLS，鸿蒙目标下不稳；用到再按 ArkTS 分块重做 |
-| `dlna_*`（9 个） | ⛔ | — | 见下 |
+| `endpoint_*` | ✅ | ArkTS `EndpointServer.ets`（`TCPSocketServer`） | 端口 39200 起顺延；请求原样发 `endpoint://request`，5s 不回 504；path 保留 query |
+| `http_download_*` | ✅ | ArkTS `HttpDownload.ets`（`@ohos.net.http`） | open 一次性取回整包，read 按 1MB 切片回 base64；es_pkg 下载快应用包走这条 |
+| `dlna_*`（8 个） | ✅ | Rust `harmony-bridge/src/dlna/*`（从 `src-tauri/src/dlna` 整体移植） | 启动即拉起 5001；SSDP/HTTP/SOAP/播放列表通道全在 Rust；事件走 `host` 队列 |
 
 ### 7.1 事件怎么从 Rust 回到页面
 
@@ -149,13 +149,61 @@ Rust 线程 ──push──> host::QUEUE(VecDeque)  ──bridge_poll(~80ms)─
 代价是最大 80ms 延迟 —— 一次性通知（文件落盘）无所谓；**手柄按键因此不走这条路**，
 在 `PadUdp.ets` 里 ArkTS 直收直推。
 
-### 7.2 为什么 DLNA 这轮不做
+### 7.2 DLNA 与 endpoint 的落地方式（2026-11 补齐）
 
-`dlna_*` 的核心是 SSDP：**必须收 239.255.255.250:1900 的组播 M-SEARCH**，否则连「被手机发现」
-都做不到。鸿蒙对组播的约束是系统级（`ohos.permission.MULTICAST` 属 system_basic，普通应用
-申请不到，`requestPermissions` 里写了也只是安装时被忽略）。定向单播（知道手机 IP 直接发
-NOTIFY）能凑出半个 DMR，但手机端的「搜索设备」列表里永远看不到本机 —— 这等于把 DLNA
-最核心的发现能力砍掉，不如明确标不支持，让页面走「手机小程序投屏」那条已验证的路。
+早期结论「鸿蒙普通应用拿不到组播」只对旧接口成立。当前 Network Kit 的
+`MulticastSocket`（API 11+）与 Socket 服务一样**只声明 `ohos.permission.INTERNET`**，
+`addMembership` 不再要 system_basic 权限 —— 所以 SSDP 是可行的。
+
+做法不是用 ArkTS 重写一遍协议栈，而是把桌面端 `src-tauri/src/dlna` **整体搬进
+`harmony-bridge`**（纯 Rust + tokio + socket2，不依赖 tauri 运行时）：
+
+- `dlna/compat.rs` 提供 `AppHandle(=host::HostHandle)` / `Emitter` / `Manager.path()` 三个替身，
+  `emit` 直接进 `host` 事件队列，由 `bridge_poll` 转给页面（与 webdav 同一条路）
+- 日志/设备名/播放列表配置的目录由 `dlna_set_root(context.filesDir)` 指定
+- `Index.ets` 启动 1.2s 后自动 `dlna_start(5001)`，与桌面端 setup 阶段一致
+
+**本机 IP 的来源（踩过坑）**：桌面端 `list_local_ipv4()` 是解析 `ifconfig` 输出，那是
+macOS/BSD 的写法；鸿蒙沙箱里既没这个可执行文件也没 PATH，结果直接是空列表 ——
+于是设备名退化成「投屏显象_00.00」，SSDP 一个接口都 join 不上，手机端搜不到本机。
+现在两层兜底：
+
+1. Rust 侧改用 `libc::getifaddrs` 直接问内核（跳过 `lo/p2p/dummy/tun/rmnet/...`、
+   过滤 `127./169.254.`），`wlan*/eth*` 排前；
+2. `NetInfo.ets::resolveLanIp()` 用 `connection.getDefaultNet()` → `getConnectionProperties()`
+   取系统权威地址（默认网络取不到则遍历 `getAllNets()`），启动时经
+   `dlna_set_local_ip(ip)` 存为 hint，`dlna_start` 仅在枚举为空时采用。
+
+`get_dlna_name()`（页面标题来源）同样先走 hint，且 IP 为空时**不缓存**兜底名 ——
+否则页面在 `dlna_start` 之前调一次就会把 `00.00` 焊死。
+
+**投屏不播（最容易漏的一环）**：Rust DMR 只负责回 SOAP 200 + `emit("dlna://play")`，
+真正换源播放的是页面里的快应用，它只认原生契约 `ACTION_DLNA` / `ACTION_DLNA_STATUS`。
+桌面端靠 `src-tauri/dlna_overlay.js`（`main.rs` 的 `initialization_script`）做这层翻译；
+鸿蒙侧一开始整段没移植，于是「能发现、能投、但不播」——事件到了页面没有监听者。
+
+现在 `bridge/DlnaOverlay.ets` 是同一份翻译，随 `javaScriptOnDocumentStart` 在
+`TAURI_SHIM_JS` 之后注入：`dlna://play → ACTION_DLNA{actionType:'playerUrl',url,title,mediaType}`、
+`seek/stop/pause → ACTION_DLNA_STATUS`，EventDispatcher 未就绪时缓存 + 500ms 轮询补发，
+`dlna://app-ready` 加速补发。
+
+同时 `Web` 组件补了两个属性，缺一个都会「投屏成功但黑屏」：
+
+| 属性 | 为什么 |
+| --- | --- |
+| `.mixedMode(MixedMode.All)` | 页面 origin 是 `https://appassets.local`，手机推的是 `http://192.168.x.x:port/...`，默认策略直接拦掉这段混合内容 |
+| `.mediaPlayGestureAccess(false)` | 投屏是程序化 `play()`，电视前没有点击动作；默认策略会把 `<video>` 挂起，手机端看到的一直是 STOPPED |
+
+排查顺序（hilog / `dlna.log`）：
+1. `[web] [dlna_overlay] ready | EventDispatcher 已就绪，投屏桥可用` —— 没有这行说明快应用没跑起来；
+2. `[web] [dlna_overlay] cast-play | 收到投屏请求` —— 没有说明事件没到页面（看 `[dlna_emit] dlna://play`）；
+3. `[web] [dlna_overlay] bridge | broadcast ACTION_DLNA` —— 有这行但仍黑屏，问题在业务层或媒体地址本身。
+
+`endpoint_*` 则用 ArkTS 的 `TCPSocketServer` 实现（`EndpointServer.ets`）：手机扫码直连、
+请求原样交给页面算、5s 超时回 504 —— 语义与 Android 插件/桌面 `endpoint.rs` 对齐。
+
+真机排查：`dlna.log` 里 `[dlna_ssdp]` 开头是自检（本机多发多收是否通），
+收不到 M-SEARCH 时先看这行，再区分是组播被系统拦还是协议不匹配。
 
 ### 7.3 宿主机自测（没有真机也能验 WebDAV）
 
@@ -183,6 +231,10 @@ curl --noproxy '*' -X PUT --data-binary @demo.nes "http://127.0.0.1:5992/es_file
 - **`aarch64-unknown-linux-ohos` 没有预编译 std**，`rustup target add` 会 404 / 卡住。
   必须 nightly + `-Zbuild-std`。
 - **`.so` 的导出名必须与 `index.d.ts` 逐字一致**，否则编译期过、运行期 `is not a function`。
+  更坑的是 napi-ohos 1.2 **默认把 Rust 的 snake_case 转成 camelCase**（`bridge_info` → `bridgeInfo`），
+  页面拿到的是 `{"__error__":"rust bridge not loaded: undefined is not callable"}`。
+  必须逐个写 `#[napi(js_name = "...")]` 固定导出名，并给构建加 `NAPI_BUILD_TARGET_NAME=quickapp_bridge`
+  （否则模块名是 crate 名 `harmony_bridge`，requireNapi 直接找不到）。
 - **本机模拟器起不来**：`Emulator -start Huawei_TV` 会卡在镜像校验之后（进程占 300%+ CPU、
   日志不再前进），这套沙箱环境里 GUI 起不来。验证只能走真机。
 - **模板字符串里不许出现反引号**：`TauriShim.ets` 里整个注入脚本是一个模板字面量，

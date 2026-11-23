@@ -25,6 +25,16 @@ interface RustBridge {
   webdav_info(): string;
   es_read_file_base64(path: string): string;
   es_list_files(): string;
+  dlna_set_root(path: string): string;
+  dlna_set_local_ip(ip: string): string;
+  dlna_start(argsJson: string): string;
+  dlna_stop(): string;
+  dlna_status(): string;
+  dlna_report_position(argsJson: string): string;
+  dlna_send_remote_event(argsJson: string): string;
+  dlna_debug_log(argsJson: string): string;
+  dlna_get_name(): string;
+  dlna_set_name(argsJson: string): string;
 }
 
 const bridge: RustBridge = rawBridge as RustBridge;
@@ -43,6 +53,8 @@ export class NapiBridge {
   /** .so 是否真的加载成功（首次调用时探测，失败则永久降级） */
   private static available: boolean = true;
   private static probed: boolean = false;
+  /** 首次探测失败的原因：页面直接看得见，省去抓 hilog 的一步 */
+  private static loadError: string = '';
 
   static isAvailable(): boolean {
     if (NapiBridge.probed) {
@@ -57,6 +69,7 @@ export class NapiBridge {
       // ArkTS 不允许把 catch 参数当 any 用（arkts-no-any-unknown），先显式收窄
       const e = err as Error;
       hilog.error(DOMAIN, TAG, 'rust bridge unavailable: %{public}s', e.message);
+      NapiBridge.loadError = e.message;
       NapiBridge.available = false;
     }
     return NapiBridge.available;
@@ -64,7 +77,8 @@ export class NapiBridge {
 
   private static guard(fn: () => string): string {
     if (!NapiBridge.isAvailable()) {
-      return '{"__error__":"rust bridge not loaded"}';
+      const detail = NapiBridge.loadError ? `: ${NapiBridge.loadError}` : '';
+      return `{"__error__":"rust bridge not loaded${detail}"}`;
     }
     try {
       return fn();
@@ -111,5 +125,47 @@ export class NapiBridge {
 
   static listFiles(): string {
     return NapiBridge.guard(() => bridge.es_list_files());
+  }
+
+  /* ---------------- DLNA（投屏接收 DMR） ---------------- */
+
+  static dlnaSetRoot(path: string): string {
+    return NapiBridge.guard(() => bridge.dlna_set_root(path));
+  }
+
+  static dlnaSetLocalIp(ip: string): string {
+    return NapiBridge.guard(() => bridge.dlna_set_local_ip(ip));
+  }
+
+  static dlnaStart(argsJson: string): string {
+    return NapiBridge.guard(() => bridge.dlna_start(argsJson));
+  }
+
+  static dlnaStop(): string {
+    return NapiBridge.guard(() => bridge.dlna_stop());
+  }
+
+  static dlnaStatus(): string {
+    return NapiBridge.guard(() => bridge.dlna_status());
+  }
+
+  static dlnaReportPosition(argsJson: string): string {
+    return NapiBridge.guard(() => bridge.dlna_report_position(argsJson));
+  }
+
+  static dlnaSendRemoteEvent(argsJson: string): string {
+    return NapiBridge.guard(() => bridge.dlna_send_remote_event(argsJson));
+  }
+
+  static dlnaDebugLog(argsJson: string): string {
+    return NapiBridge.guard(() => bridge.dlna_debug_log(argsJson));
+  }
+
+  static dlnaGetName(): string {
+    return NapiBridge.guard(() => bridge.dlna_get_name());
+  }
+
+  static dlnaSetName(argsJson: string): string {
+    return NapiBridge.guard(() => bridge.dlna_set_name(argsJson));
   }
 }
