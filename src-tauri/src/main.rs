@@ -137,7 +137,7 @@ const ES_APP_CONFIG_JSON: &str = include_str!("../es-app.config.json");
 ///   验收时 `ES_APP_PKG=es.com.nes.tv ./quickapp-desktop` 就能直接拉卡带机，
 ///   不用改配置文件再重新编译（include_str! 是编译期的，改完必须 rebuild）。
 fn es_app_config() -> (String, String) {
-    let (pkg_default, name_default) = ("cn.chenddcoder.tvcast".to_string(), "投屏显象".to_string());
+    let (pkg_default, name_default) = ("cn.chenddcoder.tvcast".to_string(), "投屏小站".to_string());
     let env_of = |k: &str| {
         std::env::var(k)
             .ok()

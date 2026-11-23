@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "投屏显象",
+  "productName": "投屏小站",
   "version": "0.1.2",
   "identifier": "com.chendd.toupingxianxiang",
   "build": {

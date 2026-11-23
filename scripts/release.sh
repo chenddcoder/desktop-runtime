@@ -31,7 +31,7 @@ DESKTOP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SRC_TAURI_DIR="$DESKTOP_DIR/src-tauri"
 WEB_RUNTIME_DIR="${WEB_RUNTIME_DIR:-$DESKTOP_DIR/../quicktvui/packages/web-runtime}"
 
-APP_NAME="投屏显象"
+APP_NAME="投屏小站"
 SERVER="${SERVER:-root@chenddcoder.cn}"
 WEB_REMOTE_DIR="/opt/www/web-runtime"
 DESKTOP_REMOTE_DIR="/opt/www/vue-ai/downloads"

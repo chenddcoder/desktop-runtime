@@ -1,4 +1,4 @@
-// DLNA 设备名持久化：默认名"投屏显象_xx.xx"，存 JSON 文件，重启保留。
+// DLNA 设备名持久化：默认名"投屏小站_xx.xx"，存 JSON 文件，重启保留。
 use std::path::PathBuf;
 
 /// 本条 DLNA 设备名配置文件（跟随可执行文件旁，与 devtools.json 同一套定位逻辑）
@@ -39,13 +39,13 @@ pub fn write_stored_name(name: &str) {
     let _ = std::fs::write(p, json);
 }
 
-/// 生成默认名：投屏显象_xx.xx（取 IPv4 后两段，缺省用 00.00）。
+/// 生成默认名：投屏小站_xx.xx（取 IPv4 后两段，缺省用 00.00）。
 pub fn default_name(local_ip: &str) -> String {
     let seg: Vec<&str> = local_ip.split('.').collect();
     if seg.len() == 4 {
-        format!("投屏显象_{}.{}", seg[2], seg[3])
+        format!("投屏小站_{}.{}", seg[2], seg[3])
     } else {
-        "投屏显象_00.00".to_string()
+        "投屏小站_00.00".to_string()
     }
 }
 
@@ -55,13 +55,13 @@ mod tests {
 
     #[test]
     fn default_name_uses_last_two_segments() {
-        assert_eq!(default_name("192.168.1.23"), "投屏显象_1.23");
-        assert_eq!(default_name("10.0.0.5"), "投屏显象_0.5");
+        assert_eq!(default_name("192.168.1.23"), "投屏小站_1.23");
+        assert_eq!(default_name("10.0.0.5"), "投屏小站_0.5");
     }
 
     #[test]
     fn default_name_falls_back_on_malformed_ip() {
-        assert_eq!(default_name("not-an-ip"), "投屏显象_00.00");
-        assert_eq!(default_name("192.168.1"), "投屏显象_00.00");
+        assert_eq!(default_name("not-an-ip"), "投屏小站_00.00");
+        assert_eq!(default_name("192.168.1"), "投屏小站_00.00");
     }
 }
