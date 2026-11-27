@@ -1,10 +1,12 @@
 //! 手机手柄 · UDP 快通道 —— 补 Android 插件 `com.quicktvui.plugin.wasm` 里 `PadModule` 的能力。
 //!
-//! ## 协议（与小程序 `utils/cast/channel.js` 逐字一致）
+//! ## 协议（与小程序 `utils/cast/channel.js` 逐字一致，只增不改）
 //! ```text
-//! 手机 → 电视   "seq,mask,t"   纯 ASCII；t 是手机毫秒戳，只进日志，不参与延迟计算
-//! 电视 → 手机   "ack,seq"      原样回传序号，手机用它结掉在途包
-//! 探活          手机发 "ping"，电视回 "ack,-1"（不碰按键）
+//! 手机 → 电视   "seq,mask"              1P（旧手机只发两段）
+//!               "seq,mask,t"            第 3 段是手机毫秒戳，只进日志，不算延迟
+//!               "seq,mask,t,seat"       seat = 0/1（新手机才发）
+//! 电视 → 手机   "ack,seq[,seat]"        原样回传序号 + 实际座位（旧手机只读前两段）
+//! 探活          手机发 "ping"，电视回 "ack,-1,2"（2 = 支持的座位数，不碰按键）
 //! ```
 //! `mask` 位：bit0=A bit1=B bit2=Select bit3=Start bit4=Up bit5=Down bit6=Left bit7=Right。
 //!
@@ -63,7 +65,7 @@ pub struct PadStats {
     pub dropped: u64,
     /// 距离最近一次收包的毫秒数；**从没收到过是 0**
     pub last_recv_ago_ms: u64,
-    /// 最近一个包的位图
+    /// 最近一个包的位图（seat0；桌面轮询兜底只还原 1P，2P 靠事件里的 seat）
     pub mask: u32,
     pub target: String,
     pub error: String,
@@ -72,7 +74,8 @@ pub struct PadStats {
 struct PadRt {
     running: bool,
     port: u16,
-    mask: u32,
+    /// 按座位各存一份最近位图：位图没变就不推事件
+    masks: [u32; 2],
     recv: u64,
     applied: u64,
     seq_gap: u64,
@@ -90,7 +93,7 @@ impl Default for PadRt {
         Self {
             running: false,
             port: 0,
-            mask: 0,
+            masks: [0, 0],
             recv: 0,
             applied: 0,
             seq_gap: 0,
@@ -109,13 +112,27 @@ fn rt() -> &'static Mutex<PadRt> {
     RT.get_or_init(|| Mutex::new(PadRt::default()))
 }
 
-/// 解析 `seq,mask,t`。任何一段不合法就整包判死（宁可丢一包，也不要把错位数据当按键）
-fn parse_packet(text: &str) -> Option<(i64, u32)> {
+/// 解析 `seq,mask[,t[,seat]]`。
+///
+/// 任何一段不合法就整包判死（宁可丢一包，也不要把错位数据当按键）。
+/// 第 3 段（时间戳）只用于日志；第 4 段 `seat` 缺省为 0（旧手机只发 2~3 段）。
+fn parse_packet(text: &str) -> Option<(i64, u32, u8)> {
     let mut it = text.trim().split(',');
     let seq: i64 = it.next()?.trim().parse().ok()?;
     let mask: u32 = it.next()?.trim().parse().ok()?;
-    // 第三段（时间戳）只用于日志，缺了也不影响按键
-    Some((seq, mask))
+    let mut seat: u8 = 0;
+    if let Some(ts) = it.next() {
+        // 第三段存在时再看有没有第四段；`ts` 本身只进日志，不校验
+        let _ = ts;
+        if let Some(s) = it.next() {
+            let v: i64 = s.trim().parse().ok()?;
+            if v != 0 && v != 1 {
+                return None; // 非法座位整包丢弃，绝不把 2P 串到 1P
+            }
+            seat = v as u8;
+        }
+    }
+    Some((seq, mask, seat))
 }
 
 /// 位图 → 8 个键（0/1）。顺序与 `pad-core.ts` 的 `b[]` 一致：
@@ -171,12 +188,13 @@ fn spawn_loop(app: AppHandle, sock: UdpSocket, stop: Arc<AtomicBool>) {
                 };
 
                 // 探活：只回执，不碰按键（手机用它判「这台电视在不在听」）
+                // 第 3 段 = 支持的座位数，新手机据此决定能不能选 2P
                 if text.trim().eq_ignore_ascii_case("ping") {
-                    let _ = sock.send_to(b"ack,-1", peer);
+                    let _ = sock.send_to(b"ack,-1,2", peer);
                     continue;
                 }
 
-                let (seq, mask) = match parse_packet(text) {
+                let (seq, mask, seat) = match parse_packet(text) {
                     Some(v) => v,
                     None => {
                         let mut g = rt().lock().unwrap_or_else(|e| e.into_inner());
@@ -185,8 +203,9 @@ fn spawn_loop(app: AppHandle, sock: UdpSocket, stop: Arc<AtomicBool>) {
                     }
                 };
 
-                // 先回执再记状态：手机侧 800ms 超时回收，回执越早越好
-                let _ = sock.send_to(format!("ack,{seq}").as_bytes(), peer);
+                // 先回执再记状态：手机侧 800ms 超时回收，回执越早越好。
+                // 带回实际座位，手机据此提示「座位被占」/决定 1P、2P。
+                let _ = sock.send_to(format!("ack,{seq},{seat}").as_bytes(), peer);
 
                 let changed = {
                     let mut g = rt().lock().unwrap_or_else(|e| e.into_inner());
@@ -200,8 +219,9 @@ fn spawn_loop(app: AppHandle, sock: UdpSocket, stop: Arc<AtomicBool>) {
                         }
                     }
                     g.last_seq = seq;
-                    let changed = g.mask != mask;
-                    g.mask = mask;
+                    let si = seat as usize;
+                    let changed = g.masks[si] != mask;
+                    g.masks[si] = mask;
                     if changed {
                         g.applied += 1;
                     }
@@ -221,6 +241,7 @@ fn spawn_loop(app: AppHandle, sock: UdpSocket, stop: Arc<AtomicBool>) {
                             "mask": mask,
                             "bits": bits_of(mask).to_vec(),
                             "seq": seq,
+                            "seat": seat,
                         }),
                     );
                 }
@@ -307,7 +328,7 @@ pub fn pad_stats() -> PadStats {
             .last_recv
             .map(|t| t.elapsed().as_millis().min(u64::MAX as u128) as u64)
             .unwrap_or(0),
-        mask: g.mask,
+        mask: g.masks[0],
         target: g.target.clone(),
         error: g.error.clone(),
     }
@@ -330,7 +351,7 @@ pub fn pad_stop() -> bool {
         let stop = g.stop.take();
         g.running = false;
         g.port = 0;
-        g.mask = 0;
+        g.masks = [0, 0];
         (stop, was)
     };
     if let Some(s) = stop {
@@ -348,7 +369,7 @@ pub fn pad_reset() -> bool {
     g.seq_gap = 0;
     g.dropped = 0;
     g.last_seq = -1;
-    g.mask = 0;
+    g.masks = [0, 0];
     g.last_recv = None;
     true
 }
@@ -360,8 +381,13 @@ mod tests {
 
     #[test]
     fn parse_ok() {
-        assert_eq!(parse_packet("12,96,1730000000000"), Some((12, 96)));
-        assert_eq!(parse_packet(" 7 , 8 ,0"), Some((7, 8)));
+        // 旧手机：2 段 / 3 段，座位缺省 0
+        assert_eq!(parse_packet("12,96"), Some((12, 96, 0)));
+        assert_eq!(parse_packet("12,96,1730000000000"), Some((12, 96, 0)));
+        assert_eq!(parse_packet(" 7 , 8 ,0"), Some((7, 8, 0)));
+        // 新手机：第 4 段带座位
+        assert_eq!(parse_packet("12,96,1730000000000,1"), Some((12, 96, 1)));
+        assert_eq!(parse_packet("12,96,0,0"), Some((12, 96, 0)));
     }
 
     #[test]
@@ -370,6 +396,9 @@ mod tests {
         assert_eq!(parse_packet("12"), None);
         assert_eq!(parse_packet("a,b,c"), None);
         assert_eq!(parse_packet(""), None);
+        // 非法座位整包丢弃
+        assert_eq!(parse_packet("12,96,0,2"), None);
+        assert_eq!(parse_packet("12,96,0,x"), None);
     }
 
     /// 位序必须和 `pad-core.ts` 的 `b[]` 对齐：上、下、左、右、A、B、SEL、STA
@@ -396,7 +425,7 @@ mod tests {
         let mut buf = [0u8; MAX_PACKET + 1];
         let (n, _) = srv.recv_from(&mut buf).expect("recv");
         let text = std::str::from_utf8(&buf[..n]).unwrap();
-        assert_eq!(parse_packet(text), Some((3, 96)));
+        assert_eq!(parse_packet(text), Some((3, 96, 0)));
         // 回执走生产同一份格式
         srv.send_to(format!("ack,{}", 3).as_bytes(), cli.local_addr().unwrap()).ok();
         let (m, _) = cli.recv_from(&mut buf).expect("ack");
